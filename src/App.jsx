@@ -7,6 +7,7 @@ import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
 import { LocalNotifications } from "@capacitor/local-notifications";
 import { syncMealWaterReminders } from "./reminders.js";
 import { logAppError } from "./monitoring.js";
+import { playSfx } from "./sound.js";
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -321,20 +322,10 @@ async function refreshTokenIfNeeded(currentToken){
 
 async function aiComplete(token,messages,system){
   try{
-    const freshToken=await refreshTokenIfNeeded(token);
-    return await supa.aiChat(freshToken,messages,system);
-  }catch(edgeErr){
-    logAppError(edgeErr,"ai.edge_function",{ isNative:isNativeApp() });
-    if(isNativeApp()){
-      throw new Error(edgeErr?.message||"AI service unavailable");
-    }
-    try{
-      const d=await openRouterDirectComplete(messages,system);
-      return d;
-    }catch(orErr){
-      logAppError(orErr,"ai.openrouter_fallback");
-      throw new Error(`Edge: ${edgeErr?.message||String(edgeErr)} | Direct: ${orErr?.message||String(orErr)}`);
-    }
+    return await openRouterDirectComplete(messages,system);
+  }catch(orErr){
+    logAppError(orErr,"ai.frontend_openrouter",{ isNative:isNativeApp() });
+    throw new Error(orErr?.message||"AI service unavailable");
   }
 }
 
@@ -346,6 +337,9 @@ function formatAiErrorMessage(error){
   }
   if(msg.includes("openrouter_api_key not set")||msg.includes("server misconfigured")){
     return "AI backend is not configured yet (missing OpenRouter key on server).";
+  }
+  if(msg.includes("missing vite_openrouter_api_key")||msg.includes("ai is not configured")){
+    return "AI is not configured in the app yet. Add VITE_OPENROUTER_API_KEY and rebuild.";
   }
   if(msg.includes("missing authorization")){
     return "Authorization missing. Please sign in again.";
@@ -1194,7 +1188,7 @@ function ForgotPassword({onBack}){
 }
 
 /* ══════════════ DASHBOARD ══════════════ */
-function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,showSearch,openNotifs,hasUnreadNotifs,showAwards}){
+function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,showSearch,openNotifs,hasUnreadNotifs,showAwards,playSfx}){
   const [sheet,setSheet]=useState(null);
   const [weightLogVal,setWeightLogVal]=useState("");
   const [weightSaving,setWeightSaving]=useState(false);
@@ -1224,7 +1218,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const sP=meals.reduce((a,m)=>a+m.p,0),sC=meals.reduce((a,m)=>a+m.c,0),sF=meals.reduce((a,m)=>a+m.f,0);
   const bmi=parseFloat(fBMI(user.weight,user.height)),bi=fBMIlabel(bmi);
   const groups=["Breakfast","Lunch","Snack","Dinner"].map(n=>({n,items:meals.filter(m=>m.m===n),emoji:{Breakfast:"🌅",Lunch:"☀️",Snack:"🍎",Dinner:"🌙"}[n]}));
-  const addRec=r=>{setMeals(p=>[...p,{id:Date.now(),name:r.n,cal:r.c,p:r.p||0,c:r.carb||0,f:r.f||0,t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),e:r.e,m:"Snack"}]);toast(`${r.n} added!`,"✅");setSheet(null);};
+  const addRec=r=>{setMeals(p=>[...p,{id:Date.now(),name:r.n,cal:r.c,p:r.p||0,c:r.carb||0,f:r.f||0,t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),e:r.e,m:"Snack"}]);playSfx&&playSfx("success");toast(`${r.n} added!`,"✅");setSheet(null);};
   useEffect(()=>{
     if(!user?.token||!user?.id){setDashWeightDelta(null);return;}
     let cancel=false;
@@ -1486,7 +1480,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
 }
 
 /* ══════════════ SCANNER ══════════════ */
-function Scanner({onAddMeal,toast,user,online=true}){
+function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const [mode,setMode]=useState(online?"search":"manual"); // search|camera|manual|barcode
   useEffect(()=>{
     if(!online&&mode!=="manual")setMode("manual");
@@ -1659,6 +1653,7 @@ function Scanner({onAddMeal,toast,user,online=true}){
           conf:100,source:"barcode",
           items:[`${p.product_name}`,`Serving: ${p.serving_size||"100g"}`,p.brands?`Brand: ${p.brands}`:""].filter(Boolean),
         });
+        playSfx&&playSfx("scan");
         setBarcodeStatus("found");
       }else{toast("Product not found. Try searching by name.","❌");setBarcodeStatus("idle");}
     }catch(e){
@@ -1676,6 +1671,7 @@ function Scanner({onAddMeal,toast,user,online=true}){
             conf:100,source:"barcode",
             items:[`${p.product_name}`,`Serving: ${p.serving_size||"100g"}`,p.brands?`Brand: ${p.brands}`:""].filter(Boolean),
           });
+          playSfx&&playSfx("scan");
           setBarcodeStatus("found");
         }else{
           toast("Product not found. Try searching by name.","❌");
@@ -1785,6 +1781,7 @@ function Scanner({onAddMeal,toast,user,online=true}){
       if(match){
         const parsed=JSON.parse(match[0]);
         setRes({...parsed,conf:88,source:"ai"});
+        playSfx&&playSfx("scan");
       }else{
         // Fallback: parse text response
         toast("AI couldn't identify this image. Try clearer lighting or manual entry.","❌");
@@ -1809,6 +1806,7 @@ function Scanner({onAddMeal,toast,user,online=true}){
   const addLog=(food)=>{
     const f=food||res;if(!f)return;
     onAddMeal({...f,cal:Math.round(f.cal*part),p:Math.round((f.p||0)*part),c:Math.round((f.c||0)*part),f:Math.round((f.f||0)*part),m:mealType,t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),id:Date.now(),e:f.emoji||"🍽️"});
+    playSfx&&playSfx("success");
     toast(`${f.name} added to ${mealType}!`,"✅");
     setAdded(true);setTimeout(()=>{setAdded(false);setRes(null);setPart(1);},2000);
   };
@@ -2314,7 +2312,7 @@ function Achievements({user,toast,inline=false}){
 }
 
 /* ══════════════ SETTINGS SCREEN ══════════════ */
-function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onDataCleared}){
+function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onDataCleared,soundFxEnabled,setSoundFxEnabled,playSfx,online,aiConfigured}){
   const [sheet,setSheet]=useState(null);
   const [pwForm,setPwForm]=useState({cur:"",nw:"",conf:""});
   const [showPws,setShowPws]=useState({cur:false,nw:false,conf:false});
@@ -2327,10 +2325,45 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
   const [feedbackSending,setFeedbackSending]=useState(false);
   const [clearingData,setClearingData]=useState(false);
   const [weightSinceFirst,setWeightSinceFirst]=useState(null);
+  const [diagLoading,setDiagLoading]=useState(false);
+  const [diag,setDiag]=useState(null);
   const bmr=fBMR(user.gender,+user.weight,+user.height,+user.age);
   const tdee=fTDEE(bmr,user.activity),tgt=fTarget(tdee,user.goal);
   const bmi=parseFloat(fBMI(user.weight,user.height)),bi=fBMIlabel(bmi);
   const avatarLetter=(user?.name?.trim?.()?.[0]||"U").toUpperCase();
+
+  const runDiagnostics=async()=>{
+    setDiagLoading(true);
+    const info={
+      network:online?"Online":"Offline",
+      auth:user?.token?"Signed in":"No session",
+      aiKey:aiConfigured?"Configured":"Missing",
+      platform:isNativeApp()?"Native app":"Web",
+      camera:"Unknown",
+      notifications:"Unknown",
+      checkedAt:new Date().toLocaleString(),
+    };
+    if(isNativeApp()){
+      try{
+        const cp=await Camera.checkPermissions();
+        info.camera=cp?.camera||"unknown";
+      }catch(e){
+        info.camera="error";
+      }
+      try{
+        const np=await LocalNotifications.checkPermissions();
+        info.notifications=np?.display||"unknown";
+      }catch(e){
+        info.notifications="error";
+      }
+    }else{
+      info.camera="n/a (web)";
+      info.notifications="n/a (web)";
+    }
+    setDiag(info);
+    setDiagLoading(false);
+    toast("Diagnostics updated","🩺");
+  };
 
   const changeProfilePicture=async()=>{
     if(!user?.token||!user?.id){toast("Please sign in first.","❌");return;}
@@ -2584,6 +2617,7 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       <div className="card" style={{marginBottom:14}}>
         <p style={{fontSize:15,fontWeight:800,marginBottom:4}}>Appearance</p>
         <SettingRow icon={Ic.moon} iconBg={T.lavBg} label="Dark Mode" sub={settings.darkMode?"Dark theme active":"Light theme active"} right={<Toggle on={settings.darkMode} set={v=>{setSetting("darkMode",v);toast(v?"Dark mode on 🌙":"Light mode on ☀️",v?"🌙":"☀️");}}/>}/>
+        <SettingRow icon={Ic.notification} iconBg={T.peachBg} label="Sound Effects" sub={soundFxEnabled?"Subtle app sounds on":"Sounds off"} right={<Toggle on={soundFxEnabled} set={v=>{setSoundFxEnabled(v);if(v){playSfx&&playSfx("success");}toast(v?"Sound effects on":"Sound effects off",v?"🔊":"🔇");}}/>}/>
         <SettingRow icon={Ic.font} iconBg={T.mintBg} label="Units" sub={units} onClick={()=>setSheet("units")}/>
       </div>
 
@@ -2591,6 +2625,7 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       <div className="card" style={{marginBottom:14}}>
         <p style={{fontSize:15,fontWeight:800,marginBottom:4}}>Health & Data</p>
         <SettingRow icon={Ic.wifi} iconBg={T.mintBg} label="Offline Mode" sub={settings.offline?"Data saved locally":"Online only"} right={<Toggle on={settings.offline} set={v=>{setSetting("offline",v);toast(v?"Offline mode on":"Online mode","📡");}}/>}/>
+        <SettingRow icon={<span style={{fontSize:17}}>🩺</span>} iconBg={T.bg} label="Diagnostics" sub="Check app health" onClick={()=>{setSheet("diagnostics");runDiagnostics();}}/>
         <SettingRow icon={<span style={{fontSize:17}}>📊</span>} iconBg={T.peachBg} label="Connected Apps" sub="Apple Health, Google Fit" onClick={()=>{toast("Health app sync coming soon!","🔗");}}/>
         <SettingRow icon={<span style={{fontSize:17}}>🗑️</span>} iconBg={T.pinkBg} label="Clear All Data" sub="Reset your history" onClick={()=>setSheet("clearData")}/>
       </div>
@@ -2700,6 +2735,19 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
         <button className="btn btn-ghost" style={{flex:1,border:"2px solid "+T.border}} onClick={()=>setSheet(null)}>Cancel</button>
         <button className="btn btn-primary" style={{flex:1}} onClick={submitFeedback} disabled={feedbackSending}>{feedbackSending?"Sending…":"Send Feedback"}</button>
       </div>
+    </Sheet>}
+
+    {/* Diagnostics */}
+    {sheet==="diagnostics"&&<Sheet title="🩺 Diagnostics" onClose={()=>setSheet(null)}>
+      <div className="card" style={{marginBottom:12}}>
+        <p style={{fontSize:13,color:T.mid,fontWeight:700,marginBottom:10}}>Quick status checks</p>
+        {diagLoading&&<p style={{fontSize:13,color:T.mid}}>Checking…</p>}
+        {!diagLoading&&diag&&<div style={{display:"grid",gap:8}}>
+          {[{k:"Network",v:diag.network},{k:"Auth",v:diag.auth},{k:"AI Key",v:diag.aiKey},{k:"Platform",v:diag.platform},{k:"Camera",v:diag.camera},{k:"Notifications",v:diag.notifications}].map(item=><div key={item.k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",background:T.bg,borderRadius:12}}><span style={{fontSize:12,fontWeight:700,color:T.mid}}>{item.k}</span><span style={{fontSize:12,fontWeight:800}}>{item.v}</span></div>)}
+          <p style={{fontSize:11,color:T.light,marginTop:4}}>Last checked: {diag.checkedAt}</p>
+        </div>}
+      </div>
+      <button className="btn btn-primary" onClick={runDiagnostics} disabled={diagLoading}>{diagLoading?"Checking…":"Run Diagnostics Again"}</button>
     </Sheet>}
 
     {/* Clear Data Confirmation */}
@@ -3035,9 +3083,13 @@ export default function App(){
   const [mealStreak,setMealStreak]=useState(0);
   const [readNotifIds,setReadNotifIds]=useState(()=>new Set());
   const [settings,setSettings]=useState(()=>{try{return JSON.parse(localStorage.getItem("nutriscan_settings"))||DEFAULT_SETTINGS;}catch(e){return DEFAULT_SETTINGS;}});
+  const [soundFxEnabled,setSoundFxEnabled]=useState(()=>{try{return JSON.parse(localStorage.getItem("nutriscan_sound_fx")||"true");}catch(e){return true;}});
   const [firstSyncLoading,setFirstSyncLoading]=useState(false);
     const [signupInitialData,setSignupInitialData]=useState(null);
   const {toasts,add:toast}=useToasts();
+  const prevMealStreakRef=useRef(0);
+
+  const playAppSfx=useCallback((name="success")=>playSfx(name,soundFxEnabled),[soundFxEnabled]);
 
   const theme=buildTheme(settings.darkMode);
   Object.assign(T,theme);
@@ -3061,6 +3113,7 @@ export default function App(){
   };
 
   useEffect(()=>{try{localStorage.setItem("nutriscan_settings",JSON.stringify(settings));}catch(e){}},[settings]);
+  useEffect(()=>{try{localStorage.setItem("nutriscan_sound_fx",JSON.stringify(soundFxEnabled));}catch(e){}},[soundFxEnabled]);
   useEffect(()=>{
     if(typeof document==="undefined")return;
     document.documentElement.style.colorScheme=settings.darkMode?"dark":"light";
@@ -3308,8 +3361,10 @@ export default function App(){
 
   /* ── Persist water to Supabase (queue when offline) ── */
   const setWaterAndSave=async(val)=>{
+    const prevWater=water;
     const v=typeof val==="function"?val(water):val;
     setWater(v);
+    if(v>prevWater)playAppSfx("water");
     if(user?.id){
       const today=new Date().toISOString().split("T")[0];
       saveLocalDay(user.id,today,meals,v);
@@ -3326,6 +3381,7 @@ export default function App(){
     const prev=meals;
     const next=typeof updater==="function"?updater(prev):updater;
     setMeals(next);
+    if(next.length>prev.length)playAppSfx("success");
     if(user?.id){
       const today=new Date().toISOString().split("T")[0];
       saveLocalDay(user.id,today,next,water);
@@ -3368,6 +3424,15 @@ export default function App(){
       return next;
     });
   };
+
+  useEffect(()=>{
+    const prev=prevMealStreakRef.current||0;
+    const cur=mealStreak||0;
+    if(cur>prev&&settings.achievementAlerts&&[7,14,30].includes(cur)){
+      playAppSfx("achievement");
+    }
+    prevMealStreakRef.current=cur;
+  },[mealStreak,settings.achievementAlerts,playAppSfx]);
 
   /* ── Auth handlers ── */
   const handleAuth=async(u)=>{
@@ -3425,11 +3490,11 @@ export default function App(){
         {showNot&&<NotificationsSheet notifications={notifications} onClose={()=>setShowNot(false)} toast={toast} onMarkAllRead={markAllNotifsRead}/>}
         {showAch&&<div className="overlay" onClick={e=>{if(e.target===e.currentTarget)setShowAch(false);}}><div className="sheet"><div className="sheet-handle"/><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}><p style={{fontSize:18,fontWeight:900}}>🏆 Achievements</p><button onClick={()=>setShowAch(false)} className="btn-icon" style={{width:32,height:32,borderRadius:10}}>{Ic.x}</button></div><Achievements user={user} toast={(m,i)=>toast(m,i||"✅")} inline/></div></div>}
         <div style={{height:"100vh",overflowY:"auto",width:"100%"}}>
-          {tab==="dashboard"    && <Dashboard    user={user} setUser={setUser} meals={meals} setMeals={setMealsAndSave} water={water} setWater={setWaterAndSave} toast={(m,i)=>toast(m,i||"✅")} setTab={setTab} showSearch={()=>setShowSrch(true)} openNotifs={openNotifs} hasUnreadNotifs={hasUnreadNotifs} showAwards={()=>setShowAch(true)}/>}
-          {tab==="scanner"      && <Scanner      onAddMeal={m=>setMealsAndSave(p=>[...p,m])} toast={(m,i)=>toast(m,i||"✅")} user={user} online={online}/>}
+          {tab==="dashboard"    && <Dashboard    user={user} setUser={setUser} meals={meals} setMeals={setMealsAndSave} water={water} setWater={setWaterAndSave} toast={(m,i)=>toast(m,i||"✅")} setTab={setTab} showSearch={()=>setShowSrch(true)} openNotifs={openNotifs} hasUnreadNotifs={hasUnreadNotifs} showAwards={()=>setShowAch(true)} playSfx={playAppSfx}/>}
+          {tab==="scanner"      && <Scanner      onAddMeal={m=>setMealsAndSave(p=>[...p,m])} toast={(m,i)=>toast(m,i||"✅")} user={user} online={online} playSfx={playAppSfx}/>}
           {tab==="analytics"    && <Analytics    user={user}/>}
           {tab==="ai"           && <AiChat       user={user} meals={meals} toast={(m,i)=>toast(m,i||"✅")} online={online}/>}
-          {tab==="settings"     && <Settings     user={user} setUser={setUser} toast={(m,i)=>toast(m,i||"✅")} onSignOut={signOut} settings={settings} setSetting={setSetting} meals={meals} onDataCleared={()=>{setMeals([]);setWater(0);}}/>}
+          {tab==="settings"     && <Settings     user={user} setUser={setUser} toast={(m,i)=>toast(m,i||"✅")} onSignOut={signOut} settings={settings} setSetting={setSetting} meals={meals} onDataCleared={()=>{setMeals([]);setWater(0);}} soundFxEnabled={soundFxEnabled} setSoundFxEnabled={setSoundFxEnabled} playSfx={playAppSfx} online={online} aiConfigured={!!OPENROUTER_KEY}/>}
         </div>
         <BottomNav active={tab} setActive={setTab}/>
       </>}

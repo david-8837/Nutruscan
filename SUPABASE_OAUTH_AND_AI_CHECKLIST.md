@@ -1,3 +1,4 @@
+
 # Supabase Auth Fix Guide (Android, Production)
 
 App package: `com.nutriscan.app`  
