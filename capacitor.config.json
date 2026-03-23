@@ -1,0 +1,13 @@
+{
+  "appId": "com.nutriscan.app",
+  "appName": "NutriScan",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "allowNavigation": [
+      "piolbedugsubngftsrkm.supabase.co",
+      "*.supabase.co",
+      "accounts.google.com"
+    ]
+  }
+}
