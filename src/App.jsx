@@ -33,9 +33,7 @@ const SUPA_URL = resolveSupabaseUrl(import.meta.env.VITE_SUPABASE_URL);
 /** Prefer .env: VITE_SUPABASE_ANON_KEY=... (Project Settings → API Keys → anon public). */
 const SUPA_KEY = (import.meta.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPA_ANON_KEY || "").trim();
 const OPENROUTER_KEY = (import.meta.env.VITE_OPENROUTER_API_KEY || "").trim();
-const OPENROUTER_TEXT_MODEL = (import.meta.env.VITE_OPENROUTER_MODEL || "trinity-large-preview:free").trim();
-const OPENROUTER_TEXT_FALLBACK_MODEL = (import.meta.env.VITE_OPENROUTER_FALLBACK_MODEL || "google/gemini-2.0-flash-001").trim();
-const OPENROUTER_VISION_MODEL = (import.meta.env.VITE_OPENROUTER_VISION_MODEL || "nvidia/nemotron-nano-12b-v2-vl:free").trim();
+const OPENROUTER_TEXT_MODEL = "arcee-ai/trinity-large-preview:free";
 const WEB3FORMS_ACCESS_KEY = (import.meta.env.VITE_WEB3FORMS_ACCESS_KEY || "").trim();
 const WEB3FORMS_ENDPOINT = "https://api.web3forms.com/submit";
 const FOOD_SEARCH_CACHE = new Map(); // Cache food search results to reduce latency
@@ -72,6 +70,10 @@ const getAvatarRemainingMs=(lastAvatarUpdate)=>{
   return Math.max(0,AVATAR_COOLDOWN_MS-(Date.now()-lastTs));
 };
 const remainingDaysLabel=(remainingMs)=>Math.max(1,Math.ceil(remainingMs/(24*60*60*1000)));
+const parseAvatarCooldownDays=(message)=>{
+  const m=String(message||"").match(/again in\s+(\d+)\s+day/i);
+  return m?Math.max(1,parseInt(m[1],10)||1):null;
+};
 const extractStorageObjectPath=(publicUrl,bucket)=>{
   try{
     const u=new URL(String(publicUrl||""));
@@ -279,11 +281,7 @@ async function openRouterDirectComplete(messages,system){
     return j?.choices?.[0]?.message?.content||"";
   };
   let text="";
-  if(hasVision){
-    text=await tryModel(OPENROUTER_VISION_MODEL);
-  }else{
-    try{text=await tryModel(OPENROUTER_TEXT_MODEL);}catch(_){text=await tryModel(OPENROUTER_TEXT_FALLBACK_MODEL);}
-  }
+  text=await tryModel(OPENROUTER_TEXT_MODEL);
   return {content:[{text}]};
 }
 
@@ -373,6 +371,27 @@ const loadLocalDay=(uid,day)=>{
     return{meals:m?JSON.parse(m):null,water:w!=null?+w:null};
   }catch(e){return{meals:null,water:null};}
 };
+const sportDayKey=(uid,day)=>`nutriscan_sport_${uid}_${day}`;
+const readSportDay=(uid,day)=>{
+  try{
+    if(!uid||!day)return{steps:0,distanceKm:0,calories:0,activeMinutes:0};
+    const raw=JSON.parse(localStorage.getItem(sportDayKey(uid,day))||"{}");
+    const steps=Math.max(0,Math.round(+raw.steps||0));
+    const distanceKm=Math.round((steps*0.00078)*100)/100;
+    const calories=Math.round(steps*0.04);
+    const activeMinutes=Math.round(steps/100);
+    return{steps,distanceKm,calories,activeMinutes};
+  }catch(e){
+    return{steps:0,distanceKm:0,calories:0,activeMinutes:0};
+  }
+};
+const writeSportDay=(uid,day,steps)=>{
+  try{
+    if(!uid||!day)return;
+    const safeSteps=Math.max(0,Math.round(+steps||0));
+    localStorage.setItem(sportDayKey(uid,day),JSON.stringify({steps:safeSteps,updatedAt:new Date().toISOString()}));
+  }catch(e){}
+};
 const readOfflineQueue=()=>{try{return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY)||"[]");}catch(e){return[];}};
 const writeOfflineQueue=q=>{try{localStorage.setItem(OFFLINE_QUEUE_KEY,JSON.stringify(q));}catch(e){}};
 const enqueueOffline=o=>{const q=readOfflineQueue();q.push(o);writeOfflineQueue(q);};
@@ -407,6 +426,11 @@ const PROFILE_AVATARS = [
   { idx: 8, name: 'Red', bg: 'linear-gradient(135deg, #E05060 0%, #C84050 100%)', emoji: '💪' },
   { idx: 9, name: 'Navy', bg: 'linear-gradient(135deg, #1C1C2E 0%, #2E2E44 100%)', emoji: '🎯' },
 ];
+const PROFILE_GALLERY_IMAGES = Object.entries(
+  import.meta.glob("../Profile Pic/*.{jpg,jpeg,png,webp}", { eager: true, import: "default" })
+)
+  .sort(([a], [b]) => a.localeCompare(b))
+  .map(([, url]) => String(url));
 
 /* ══════════════ TOKENS ══════════════ */
 const LIGHT = {
@@ -1194,7 +1218,14 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const [weightSaving,setWeightSaving]=useState(false);
   const [mealView,setMealView]=useState(null);
   const [dashWeightDelta,setDashWeightDelta]=useState(null);
+  const [sportTracking,setSportTracking]=useState(false);
+  const [sportSensorReady,setSportSensorReady]=useState(true);
+  const [sportData,setSportData]=useState({steps:0,distanceKm:0,calories:0,activeMinutes:0});
+  const motionHandlerRef=useRef(null);
+  const stepCountRef=useRef(0);
+  const peakStateRef=useRef({lastStepTs:0,prevMag:9.8});
   const isDark=T.bg==="#0F0F1A";
+  const todayKey=ymdLocal(new Date());
   const greeting=useMemo(()=>{
     const h=new Date().getHours();
     if(h>=5&&h<12)return "Good Morning";
@@ -1236,7 +1267,80 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
 
   const HEART=[{t:"00:00",bpm:62},{t:"06:00",bpm:68},{t:"08:00",bpm:95},{t:"12:00",bpm:82},{t:"15:00",bpm:88},{t:"18:00",bpm:92},{t:"20:00",bpm:74},{t:"00:00",bpm:64}];
   const SLEEP=[{d:"Mon",h:7.2},{d:"Tue",h:6.8},{d:"Wed",h:8.1},{d:"Thu",h:7.5},{d:"Fri",h:6.5},{d:"Sat",h:8.8},{d:"Sun",h:7.9}];
-  const SPORT=[{name:"Steps",val:8240,max:10000,icon:"👟",color:T.mint},{name:"Calories",val:420,max:600,icon:"🔥",color:T.pink},{name:"Active Min",val:45,max:60,icon:"⏱️",color:T.lav},{name:"Distance",val:5.4,max:8,icon:"📍",color:T.peach}];
+  const SPORT=[
+    {name:"Steps",val:sportData.steps,max:10000,icon:"👟",color:T.mint,fmt:v=>v},
+    {name:"Calories",val:sportData.calories,max:600,icon:"🔥",color:T.pink,fmt:v=>v},
+    {name:"Active Min",val:sportData.activeMinutes,max:90,icon:"⏱️",color:T.lav,fmt:v=>v},
+    {name:"Distance",val:sportData.distanceKm,max:8,icon:"📍",color:T.peach,fmt:v=>v.toFixed(1)},
+  ];
+
+  useEffect(()=>{
+    if(!user?.id){
+      setSportData({steps:0,distanceKm:0,calories:0,activeMinutes:0});
+      return;
+    }
+    const loaded=readSportDay(user.id,todayKey);
+    stepCountRef.current=loaded.steps;
+    setSportData(loaded);
+  },[user?.id,todayKey]);
+
+  const stopSportSensor=useCallback(()=>{
+    if(motionHandlerRef.current){
+      window.removeEventListener("devicemotion",motionHandlerRef.current);
+      motionHandlerRef.current=null;
+    }
+    setSportTracking(false);
+  },[]);
+
+  const startSportSensor=useCallback(async()=>{
+    if(!user?.id){toast("Sign in to track sport data.","❌");return;}
+    if(typeof window==="undefined"||typeof window.addEventListener!=="function"||typeof DeviceMotionEvent==="undefined"){
+      setSportSensorReady(false);
+      toast("Motion sensor not available on this phone/browser.","⚠️");
+      return;
+    }
+    try{
+      if(typeof DeviceMotionEvent.requestPermission==="function"){
+        const perm=await DeviceMotionEvent.requestPermission();
+        if(perm!=="granted"){
+          toast("Motion permission denied.","❌");
+          return;
+        }
+      }
+    }catch(e){
+      toast("Could not access motion sensor.","❌");
+      return;
+    }
+
+    if(motionHandlerRef.current)return;
+    const handler=(ev)=>{
+      const a=ev?.accelerationIncludingGravity;
+      if(!a)return;
+      const x=+a.x||0,y=+a.y||0,z=+a.z||0;
+      const mag=Math.sqrt(x*x+y*y+z*z);
+      const now=Date.now();
+      const st=peakStateRef.current;
+      const crossed=mag>12.2&&st.prevMag<=12.2;
+      if(crossed&&now-st.lastStepTs>320){
+        st.lastStepTs=now;
+        stepCountRef.current+=1;
+        if(stepCountRef.current%5===0){
+          const stored=readSportDay(user.id,todayKey);
+          const updatedSteps=Math.max(stored.steps,stepCountRef.current);
+          writeSportDay(user.id,todayKey,updatedSteps);
+          setSportData(readSportDay(user.id,todayKey));
+        }
+      }
+      st.prevMag=mag;
+    };
+    motionHandlerRef.current=handler;
+    window.addEventListener("devicemotion",handler,{passive:true});
+    setSportSensorReady(true);
+    setSportTracking(true);
+    toast("Sport sensor tracking started.","🏃");
+  },[todayKey,toast,user?.id]);
+
+  useEffect(()=>()=>{if(motionHandlerRef.current)window.removeEventListener("devicemotion",motionHandlerRef.current);},[]);
 
   return <div style={{paddingBottom:110}}>
     <SBar/>
@@ -1276,7 +1380,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       </div>
       {/* 4-grid */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        {[{title:"Sport Data",sub:"Keep Active, Keep Healthy",icon:"📊",bg:T.peachBg,key:"sport"},{title:"Hydration",sub:`${water}/8 glasses · ${water*250}ml`,icon:"💧",bg:T.lavBg,key:"hydration"},{title:"Sleep Quality",sub:"Check Your Sleep Quality",icon:"😴",bg:T.mintBg,key:"sleep"},{title:"BMI",sub:`BMI: ${bmi} — ${bi.l}`,icon:"⚖️",bg:T.pinkBg,key:"bmi"}].map(c=>(
+        {[{title:"Sport Data",sub:`${sportData.steps} steps · ${sportData.distanceKm.toFixed(1)} km`,icon:"📊",bg:T.peachBg,key:"sport"},{title:"Hydration",sub:`${water}/8 glasses · ${water*250}ml`,icon:"💧",bg:T.lavBg,key:"hydration"},{title:"Sleep Quality",sub:"Check Your Sleep Quality",icon:"😴",bg:T.mintBg,key:"sleep"},{title:"BMI",sub:`BMI: ${bmi} — ${bi.l}`,icon:"⚖️",bg:T.pinkBg,key:"bmi"}].map(c=>(
           <div key={c.key} className="pcard hover-card" style={{background:c.bg,padding:"16px"}} onClick={()=>setSheet(c.key)}>
                         <div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:36,height:36,borderRadius:10,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,boxShadow:`0 2px 6px ${T.shadow}`}}>{c.icon}</div><div style={{width:26,height:26,borderRadius:8,background:isDark?"rgba(108,168,255,.22)":"rgba(255,255,255,.6)",display:"flex",alignItems:"center",justifyContent:"center",color:isDark?T.blue:T.mid,border:isDark?`1px solid ${T.blue}55`:"none"}}>{Ic.trend}</div></div>
             <p style={{fontSize:14,fontWeight:800,marginTop:12,lineHeight:1.2}}>{c.title}</p>
@@ -1349,17 +1453,23 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       </div>
       {/* Bottom sport+hydration */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:4}}>
-        <div className="pcard hover-card" style={{background:T.peachBg,padding:"16px"}} onClick={()=>setSheet("sport")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📊</div><div style={{color:isDark?T.blue:T.mid}}>{Ic.trend}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Sport Data</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>Keep Active, Keep Healthy</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
+        <div className="pcard hover-card" style={{background:T.peachBg,padding:"16px"}} onClick={()=>setSheet("sport")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📊</div><div style={{color:isDark?T.blue:T.mid}}>{Ic.trend}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Sport Data</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{sportData.steps} steps · {sportData.activeMinutes} min active</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
         <div className="pcard hover-card" style={{background:T.lavBg,padding:"16px"}} onClick={()=>setSheet("hydration")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>💧</div><div style={{color:T.purple}}>{Ic.drop}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Hydration</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{water}/8 glasses · {water*250}ml</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
       </div>
     </div>
 
     {/* SHEETS */}
     {sheet==="sport"&&<Sheet title="🏃 Sport Data" onClose={()=>setSheet(null)}>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
-        {SPORT.map(s=><div key={s.name} className="pcard" style={{background:s.color+"33",padding:"16px"}}><p style={{fontSize:22}}>{s.icon}</p><p style={{fontSize:22,fontWeight:900,marginTop:8}}>{s.val}<span style={{fontSize:12,color:T.mid,fontWeight:600}}> /{s.max}</span></p><p style={{fontSize:12,color:T.mid,fontWeight:600,marginTop:2}}>{s.name}</p><div className="mbar" style={{marginTop:10}}><div className="mbar-f" style={{width:`${(s.val/s.max)*100}%`,background:s.color}}/></div></div>)}
+      <div style={{display:"flex",gap:10,marginBottom:12}}>
+        {!sportTracking
+          ?<button className="btn btn-primary" style={{flex:1}} onClick={startSportSensor}>Start Sensor Tracking</button>
+          :<button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.border}`}} onClick={stopSportSensor}>Stop Sensor Tracking</button>}
       </div>
-      <div className="card" style={{marginBottom:14}}><p style={{fontSize:14,fontWeight:800,marginBottom:14}}>Steps This Week</p><ResponsiveContainer width="100%" height={140}><BarChart data={[{d:"M",v:6200},{d:"T",v:8400},{d:"W",v:7100},{d:"T",v:9200},{d:"F",v:8240},{d:"S",v:5600},{d:"S",v:4300}]} margin={{top:5,right:5,bottom:0,left:-24}}><CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="d" tick={{fill:T.light,fontSize:11,fontFamily:"Nunito",fontWeight:600}}/><YAxis tick={{fill:T.light,fontSize:10,fontFamily:"Nunito"}}/><Tooltip contentStyle={{background:T.white,border:`1px solid ${T.border}`,borderRadius:12,fontFamily:"Nunito"}} formatter={v=>[`${v} steps`]}/><Bar dataKey="v" fill={T.mint} radius={[6,6,0,0]}/></BarChart></ResponsiveContainer></div>
+      {!sportSensorReady&&<p style={{fontSize:12,color:T.red,fontWeight:700,marginBottom:12}}>Motion sensor unavailable. You can still log meals/water and view other stats.</p>}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
+        {SPORT.map(s=><div key={s.name} className="pcard" style={{background:s.color+"33",padding:"16px"}}><p style={{fontSize:22}}>{s.icon}</p><p style={{fontSize:22,fontWeight:900,marginTop:8}}>{s.fmt(s.val)}<span style={{fontSize:12,color:T.mid,fontWeight:600}}> /{s.max}</span></p><p style={{fontSize:12,color:T.mid,fontWeight:600,marginTop:2}}>{s.name}</p><div className="mbar" style={{marginTop:10}}><div className="mbar-f" style={{width:`${Math.min(100,(s.val/s.max)*100)}%`,background:s.color}}/></div></div>)}
+      </div>
+      <div className="card" style={{marginBottom:14}}><p style={{fontSize:14,fontWeight:800,marginBottom:14}}>Steps This Week</p><ResponsiveContainer width="100%" height={140}><BarChart data={dateRangeInclusive(todayKey,7).map(d=>({d:new Date(d+"T12:00:00").toLocaleDateString("en-IN",{weekday:"narrow"}),v:readSportDay(user.id,d).steps}))} margin={{top:5,right:5,bottom:0,left:-24}}><CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="d" tick={{fill:T.light,fontSize:11,fontFamily:"Nunito",fontWeight:600}}/><YAxis tick={{fill:T.light,fontSize:10,fontFamily:"Nunito"}}/><Tooltip contentStyle={{background:T.white,border:`1px solid ${T.border}`,borderRadius:12,fontFamily:"Nunito"}} formatter={v=>[`${v} steps`]}/><Bar dataKey="v" fill={T.mint} radius={[6,6,0,0]}/></BarChart></ResponsiveContainer></div>
       <button className="btn btn-primary" onClick={()=>{toast("Workout logged! 💪","✅");setSheet(null);}}>+ Log Today's Workout</button>
     </Sheet>}
 
@@ -1515,6 +1625,8 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const [barcodeLoading,setBarcodeLoading]=useState(false);
   const [barcodeStatus,setBarcodeStatus]=useState("idle");
   const [barcodeInput,setBarcodeInput]=useState("");
+  const barcodeStartRef=useRef(0);
+  const barcodeOpenTimeoutRef=useRef(null);
 
   // ── CAMERA/AI state ──
   const [scan,setScan]=useState(false);
@@ -1560,12 +1672,13 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   };
 
   const searchFood=async(q)=>{
-    if(!q.trim()){setSearchResults([]);setSearchDone(false);return;}
-    if(!user?.token){toast("Sign in to search foods.","❌");return;}
+    if(!q.trim()){setSearchResults([]);setSearchDone(false);setSearchLoading(false);return;}
+    if(!user?.token){setSearchLoading(false);toast("Sign in to search foods.","❌");return;}
     const cacheKey=q.trim().toLowerCase();
     if(FOOD_SEARCH_CACHE.has(cacheKey)){
       setSearchResults(FOOD_SEARCH_CACHE.get(cacheKey));
       setSearchDone(true);
+      setSearchLoading(false);
       return;
     }
     setSearchLoading(true);setSearchDone(false);setRes(null);
@@ -1596,8 +1709,10 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const onSearchChange=v=>{
     setSearchQ(v);
     clearTimeout(searchTimer.current);
-    if(v.length>2)searchTimer.current=setTimeout(()=>searchFood(v),600);
-    else{setSearchResults([]);setSearchDone(false);}
+    if(v.length>2){
+      setSearchLoading(true);
+      searchTimer.current=setTimeout(()=>searchFood(v),600);
+    }else{setSearchResults([]);setSearchDone(false);setSearchLoading(false);}
   };
 
   // Apply filters + sort
@@ -1620,20 +1735,16 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const openRearCameraStream=async()=>{
     if(!navigator?.mediaDevices?.getUserMedia)throw new Error("Camera not supported on this device.");
     const baseVideo={width:{ideal:960,max:1280},height:{ideal:540,max:720},frameRate:{ideal:20,max:24}};
-    let stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},...baseVideo}});
+    let stream;
     try{
-      const devices=await navigator.mediaDevices.enumerateDevices();
-      const rear=devices.find(d=>d.kind==="videoinput"&&/back|rear|environment/i.test(d.label||""));
-      const currentLabel=stream?.getVideoTracks?.()[0]?.label||"";
-      if(rear&&!/back|rear|environment/i.test(currentLabel)){
-        stream.getTracks().forEach(t=>t.stop());
-        stream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:rear.deviceId},...baseVideo}});
-      }
-      const track=stream?.getVideoTracks?.()[0];
-      if(track?.applyConstraints){
-        await track.applyConstraints({frameRate:{ideal:20,max:24}}).catch(()=>{});
-      }
-    }catch(e){}
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:"environment"},...baseVideo}});
+    }catch(e){
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},...baseVideo}});
+    }
+    const track=stream?.getVideoTracks?.()[0];
+    if(track?.applyConstraints){
+      await track.applyConstraints({frameRate:{ideal:20,max:24}}).catch(()=>{});
+    }
     return stream;
   };
 
@@ -1700,16 +1811,42 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   };
 
   const startBarcodeCam=async()=>{
-    setCamErr("");setBarcodeStatus("scanning");setRes(null);
+    const reqId=++barcodeStartRef.current;
+    if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
+    setCamErr("");setBarcodeStatus("opening");setRes(null);
+    barcodeOpenTimeoutRef.current=setTimeout(()=>{
+      setBarcodeStatus(s=>{
+        if(s!=="opening")return s;
+        setCamErr("Camera took too long to open. Enter barcode manually.");
+        return "manual-barcode";
+      });
+    },8000);
     try{
       // Use web-based barcode detection (native ML Kit barcode scanner disabled due to Android compilation issues)
       if(true){ // Temporarily disable native, use web fallback always
         // Fallback to web-based barcode detection
         const perm=await requestCameraPermission();
-        if(!perm)return;
+        if(!perm){
+          if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
+          setBarcodeStatus("idle");
+          return;
+        }
         const stream=await openRearCameraStream();
+        if(reqId!==barcodeStartRef.current){
+          stream.getTracks().forEach(t=>t.stop());
+          return;
+        }
         streamRef.current=stream;
-        if(videoRef.current){videoRef.current.srcObject=stream;videoRef.current.play();}
+        if(videoRef.current){
+          videoRef.current.srcObject=stream;
+          try{await videoRef.current.play();}catch(e){}
+        }
+        if(reqId!==barcodeStartRef.current){
+          stopBarcodeCam();
+          return;
+        }
+        if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
+        setBarcodeStatus("scanning");
         if("BarcodeDetector" in window){
           const detector=new window.BarcodeDetector({formats:["ean_13","ean_8","upc_a","upc_e","code_128","code_39","qr_code"]});
           intervalRef.current=setInterval(async()=>{
@@ -1718,16 +1855,19 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
               if(codes.length>0){clearInterval(intervalRef.current);stopBarcodeCam();await lookupBarcode(codes[0].rawValue);}
             }catch(e){}
           },500);
-          setTimeout(()=>{clearInterval(intervalRef.current);if(barcodeStatus==="scanning"){stopBarcodeCam();setBarcodeStatus("manual-barcode");}},25000);
-        }else{setBarcodeStatus("manual-barcode");}
+          setTimeout(()=>{clearInterval(intervalRef.current);setBarcodeStatus(s=>{if(s==="scanning"){stopBarcodeCam();return"manual-barcode";}return s;});},25000);
+        }else{stopBarcodeCam();setBarcodeStatus("manual-barcode");}
       }
     }catch(e){
+      if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
       logAppError(e,"scanner.barcode_start");
       setCamErr("Barcode scanning failed. Try manual entry.");setBarcodeStatus("manual-barcode");
     }
   };
 
   const stopBarcodeCam=()=>{
+    barcodeStartRef.current+=1;
+    if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
     clearInterval(intervalRef.current);
     if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}
     if(videoRef.current)videoRef.current.srcObject=null;
@@ -1965,6 +2105,13 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
           </div>
         </div>}
 
+        {barcodeStatus==="opening"&&<div className="card" style={{marginBottom:16,textAlign:"center",padding:"24px 18px"}}>
+          <div className="aSpin" style={{width:34,height:34,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/>
+          <p style={{fontSize:14,fontWeight:800,marginBottom:4}}>Opening camera…</p>
+          <p style={{fontSize:12,color:T.light,fontWeight:600}}>This can take a few seconds on some phones</p>
+          <button className="btn btn-ghost" style={{marginTop:12}} onClick={()=>{stopBarcodeCam();setBarcodeStatus("idle");}}>Cancel</button>
+        </div>}
+
         {barcodeStatus==="scanning"&&<div className="card" style={{marginBottom:16}}>
           <div style={{borderRadius:16,overflow:"hidden",aspectRatio:"4/3",background:"#000",marginBottom:12,position:"relative"}}>
             <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"cover"}} playsInline muted autoPlay/>
@@ -2155,7 +2302,7 @@ function Analytics({user}){
   const wm=weightMeta;
   const insightCards=useMemo(()=>buildAnalyticsInsights({calByDate,proteinByDate,calTarget,streak,onTargetCount,weightMeta,goal:user?.goal}),[calByDate,proteinByDate,calTarget,streak,onTargetCount,weightMeta,user?.goal]);
 
-  if(loading)return <div style={{paddingBottom:110}}><SBar/><div style={{padding:48,textAlign:"center"}}><div className="aSpin" style={{width:40,height:40,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 16px"}}/><p style={{color:T.mid,fontWeight:700}}>Loading analytics…</p></div></div>;
+  if(loading)return <div style={{paddingBottom:110}}><SBar/><div style={{minHeight:"calc(100vh - 180px)",display:"flex",alignItems:"center",justifyContent:"center",padding:"24px 16px",textAlign:"center"}}><div><div className="aSpin" style={{width:30,height:30,border:`2.5px solid ${T.lav}`,borderTop:`2.5px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/><p style={{color:T.mid,fontWeight:700,fontSize:14}}>Loading stats…</p></div></div></div>;
 
   return <div style={{paddingBottom:110}}><SBar/>
     <div style={{padding:"4px 16px 20px",maxWidth:600,margin:"0 auto",width:"100%"}}>
@@ -2332,6 +2479,11 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
   const bmi=parseFloat(fBMI(user.weight,user.height)),bi=fBMIlabel(bmi);
   const avatarLetter=(user?.name?.trim?.()?.[0]||"U").toUpperCase();
 
+  useEffect(()=>{
+    const idx=PROFILE_GALLERY_IMAGES.findIndex(u=>u===user?.profileImageUrl);
+    if(idx>=0&&idx!==profileAvatar)setProfileAvatar(idx);
+  },[user?.profileImageUrl,profileAvatar]);
+
   const runDiagnostics=async()=>{
     setDiagLoading(true);
     const info={
@@ -2406,9 +2558,39 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       toast("Profile picture updated!","✅");
     }catch(e){
       const m=String(e?.message||"");
-      const dm=m.match(/again in\s+(\d+)\s+day/i);
-      if(dm){toast(`You can change your profile picture again in ${dm[1]} day${Number(dm[1])===1?"":"s"}.`,"⏳");setProfileImageUploading(false);return;}
+      const cd=parseAvatarCooldownDays(m);
+      if(cd){toast(`You can change your profile picture again in ${cd} day${cd===1?"":"s"}.`,"⏳");setProfileImageUploading(false);return;}
       if(!/cancel|canceled|user cancelled/i.test(m))toast(m&&/permission/i.test(m)?"Camera/gallery permission denied.":"Could not update picture.","❌");
+    }
+    setProfileImageUploading(false);
+  };
+
+  const chooseProfileFromGallery=async(imageUrl,idx)=>{
+    if(!user?.token||!user?.id){toast("Please sign in first.","❌");return;}
+    if(!imageUrl){toast("Image not available.","❌");return;}
+    const remainingMs=getAvatarRemainingMs(user?.lastAvatarUpdate);
+    if(remainingMs>0){
+      toast(`You can change your profile picture again in ${remainingDaysLabel(remainingMs)} day${remainingDaysLabel(remainingMs)===1?"":"s"}.`,"⏳");
+      return;
+    }
+    setProfileImageUploading(true);
+    try{
+      const oldUrl=String(user?.profileImageUrl||"");
+      const oldPath=extractStorageObjectPath(oldUrl,PROFILE_IMAGE_BUCKET);
+      const ok=await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{profile_image_url:imageUrl});
+      if(!ok)throw new Error("Couldn't save profile image");
+      if(oldPath){
+        await supa.removeStorageObject(user.token,PROFILE_IMAGE_BUCKET,oldPath).catch(()=>null);
+      }
+      setProfileAvatar(idx);
+      setUser(prev=>prev?{...prev,profileImageUrl:imageUrl,lastAvatarUpdate:new Date().toISOString()}:prev);
+      setEditForm(prev=>({...prev,profileImageUrl:imageUrl}));
+      toast("Profile photo updated!","🖼️");
+      setSheet(null);
+    }catch(e){
+      const cd=parseAvatarCooldownDays(e?.message);
+      if(cd){toast(`You can change your profile picture again in ${cd} day${cd===1?"":"s"}.`,"⏳");}
+      else toast("Could not set profile photo.","❌");
     }
     setProfileImageUploading(false);
   };
@@ -2607,10 +2789,10 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       {/* NOTIFICATIONS */}
       <div className="card" style={{marginBottom:14}}>
         <p style={{fontSize:15,fontWeight:800,marginBottom:4}}>Notifications</p>
-        <SettingRow icon={Ic.food} iconBg={T.pinkBg} label="Meal Reminders" sub={settings.mealReminders?"Reminders on":"Reminders off"} right={<Toggle on={settings.mealReminders} set={v=>{setSetting("mealReminders",v);toast(v?"Meal reminders on":"Meal reminders off",v?"🍽️":"🔕");}}/>}/>
-        <SettingRow icon={Ic.drop} iconBg={T.lavBg} label="Water Reminders" sub={settings.waterReminders?"Every 2 hours":"Off"} right={<Toggle on={settings.waterReminders} set={v=>{setSetting("waterReminders",v);toast(v?"Water reminders on":"Water reminders off",v?"💧":"🔕");}}/>}/>
+        <SettingRow icon={Ic.food} iconBg={T.pinkBg} label="Meal Reminders (Phone)" sub={settings.mealReminders?"Phone reminders + nudges are on":"Phone reminders are off"} right={<Toggle on={settings.mealReminders} set={v=>{setSetting("mealReminders",v);toast(v?"Phone meal reminders on":"Phone meal reminders off",v?"🍽️":"🔕");}}/>}/>
+        <SettingRow icon={Ic.drop} iconBg={T.lavBg} label="Water Reminders (Phone)" sub={settings.waterReminders?"Every 2 hours (9:00 AM–9:00 PM)":"Off"} right={<Toggle on={settings.waterReminders} set={v=>{setSetting("waterReminders",v);toast(v?"Phone water reminders on (9:00 AM–9:00 PM)":"Phone water reminders off",v?"💧":"🔕");}}/>}/>
         <SettingRow icon={Ic.heart} iconBg={T.mintBg} label="Health Insights" sub={settings.healthInsights?"Weekly AI insights":"Off"} right={<Toggle on={settings.healthInsights} set={v=>{setSetting("healthInsights",v);toast(v?"Health insights on":"Health insights off",v?"🤖":"🔕");}}/>}/>
-        <SettingRow icon={Ic.trophy} iconBg={T.peachBg} label="Achievement Alerts" sub={settings.achievementAlerts?"Notify on unlock":"Off"} right={<Toggle on={settings.achievementAlerts} set={v=>{setSetting("achievementAlerts",v);toast(v?"Achievement alerts on":"Achievement alerts off",v?"🏆":"🔕");}}/>}/>
+        <SettingRow icon={Ic.trophy} iconBg={T.peachBg} label="Achievement Alerts (In-App)" sub={settings.achievementAlerts?"Milestones shown inside app":"Off"} right={<Toggle on={settings.achievementAlerts} set={v=>{setSetting("achievementAlerts",v);toast(v?"In-app achievement alerts on":"In-app achievement alerts off",v?"🏆":"🔕");}}/>}/>
       </div>
 
       {/* APPEARANCE */}
@@ -2663,7 +2845,10 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
               ?<img src={user.profileImageUrl} alt="Profile" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
               :avatarLetter}
           </div>
-          <button className="btn btn-ghost" style={{flex:1,border:"2px solid "+T.border}} onClick={changeProfilePicture} disabled={profileImageUploading}>{profileImageUploading?"Updating…":"Change Profile Picture"}</button>
+          <div style={{display:"flex",flexDirection:"column",gap:8,flex:1}}>
+            <button className="btn btn-ghost" style={{border:"2px solid "+T.border}} onClick={changeProfilePicture} disabled={profileImageUploading}>{profileImageUploading?"Updating…":"Upload from Camera/Gallery"}</button>
+            <button className="btn btn-ghost" style={{border:"2px solid "+T.border}} onClick={()=>setSheet("avatar")} disabled={profileImageUploading||!PROFILE_GALLERY_IMAGES.length}>{PROFILE_GALLERY_IMAGES.length?"Choose from App Gallery":"No gallery images found"}</button>
+          </div>
         </div>
         {[{k:"name",l:"Full Name",t:"text"},{k:"age",l:"Age",t:"number"},{k:"weight",l:"Weight (kg)",t:"number"},{k:"height",l:"Height (cm)",t:"number"}].map(f=><div key={f.k}><label className="flabel">{f.l}</label><input className="inp" type={f.t} value={editForm[f.k]} onChange={e=>setEditForm(p=>({...p,[f.k]:e.target.value}))}/></div>)}
         <div><label className="flabel">Gender</label><select className="inp" value={editForm.gender||"male"} onChange={e=>setEditForm(p=>({...p,gender:e.target.value}))}><option value="male">Male</option><option value="female">Female</option></select></div>
@@ -2717,11 +2902,10 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
     {/* Avatar */}
     {sheet==="avatar"&&<Sheet title="🖼️ Profile Avatar" onClose={()=>setSheet(null)}>
       <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
-        {PROFILE_AVATARS.map(a=>{
-          const selected=profileAvatar===a.idx;
-          return <button key={a.idx} onClick={()=>{setProfileAvatar(a.idx);toast(`Avatar set to ${a.name}`,"🖼️");setSheet(null);}} style={{padding:"12px",borderRadius:14,border:`2px solid ${selected?T.purple:T.border}`,background:selected?T.lavBg:T.bg,cursor:"pointer",fontFamily:"Nunito",display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
-            <div className="avatar" style={{width:46,height:46,fontSize:20,background:a.bg}}>{a.emoji}</div>
-            <span style={{fontSize:12,fontWeight:700,color:T.mid}}>{a.name}</span>
+        {PROFILE_GALLERY_IMAGES.map((imgUrl,idx)=>{
+          const selected=profileAvatar===idx;
+          return <button key={imgUrl} onClick={()=>chooseProfileFromGallery(imgUrl,idx)} style={{padding:"6px",borderRadius:14,border:`2px solid ${selected?T.purple:T.border}`,background:selected?T.lavBg:T.bg,cursor:"pointer",fontFamily:"Nunito",display:"flex",alignItems:"center",justifyContent:"center",aspectRatio:"1/1",overflow:"hidden"}}>
+            <img src={imgUrl} alt={`Profile option ${idx+1}`} style={{width:"100%",height:"100%",objectFit:"cover",borderRadius:10}}/>
           </button>;
         })}
       </div>
@@ -2957,72 +3141,75 @@ function BottomNav({active,setActive}){
   return <div className="bnav">{tabs.map(t=><button key={t.id} className={`nb${active===t.id?" active":""}`} onClick={()=>setActive(t.id)}><div className="nb-icon"><svg width="20" height="20" fill="none" stroke={active===t.id?T.white:T.light} strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">{P[t.id]}</svg></div><span>{t.label}</span></button>)}</div>;
 }
 
-function buildSmartNotifications({user,meals,water,streak}){
+function buildInAppProgressNotifications({user,meals,water,streak}){
   if(!user)return[];
   const today=ymdLocal(new Date());
-  const hour=new Date().getHours();
   const b=fBMR(user.gender,+user.weight,+user.height,+user.age);
   const tgt=fTarget(fTDEE(b,user.activity),user.goal);
+  const {tP,tC,tF}=macroTargets(tgt);
   const eaten=meals.reduce((a,m)=>a+(+m.cal||0),0);
-  const hasB=meals.some(m=>m.m==="Breakfast");
-  const hasL=meals.some(m=>m.m==="Lunch");
-  const hasD=meals.some(m=>m.m==="Dinner");
+  const protein=meals.reduce((a,m)=>a+(+m.p||0),0);
+  const carbs=meals.reduce((a,m)=>a+(+m.c||0),0);
+  const fat=meals.reduce((a,m)=>a+(+m.f||0),0);
   const out=[];
-  if(hour>=9&&!hasB)out.push({id:`bf-${today}`,e:"🌅",title:"Time to log breakfast!",sub:"It's morning and no breakfast logged yet",t:"Now"});
-  if(hour>=13&&!hasL)out.push({id:`ln-${today}`,e:"☀️",title:"Log your lunch!",sub:"Don't forget to track your midday meal",t:"Now"});
-  if(hour>=20&&!hasD)out.push({id:`dn-${today}`,e:"🌙",title:"Log your dinner!",sub:"Almost end of day — track your last meal",t:"Now"});
-  if(hour>=14&&water<4)out.push({id:`wtr-${today}`,e:"💧",title:"Drink more water!",sub:`You've only had ${water} glasses today`,t:"Now"});
-  if(eaten>tgt){
-    const x=eaten-tgt;
-    out.push({id:`ov-${today}`,e:"⚠️",title:"Over your goal!",sub:`You're ${x} kcal over today's target`,t:"Now"});
-  }else if(eaten>=tgt*.95&&eaten<tgt){
-    const x=Math.round(tgt-eaten);
-    out.push({id:`al-${today}`,e:"🎯",title:"Almost at your goal!",sub:`Just ${x} kcal away from your target`,t:"Now"});
+
+  [3,7,14,30].forEach((m)=>{
+    if(streak===m){
+      out.push({id:`st-${m}-${today}`,e:"🔥",title:`${m}-day streak milestone!`,sub:`Great consistency — you've logged meals for ${m} days in a row.`,t:"Today"});
+    }
+  });
+
+  if(meals.length>0&&eaten>=tgt*.95&&eaten<=tgt*1.05){
+    out.push({id:`goal-hit-${today}`,e:"🎯",title:"You hit today's calorie target 🎯",sub:`${Math.round(eaten)} / ${tgt} kcal — right in the target zone.`,t:"Today"});
   }
-  if(streak===7)out.push({id:`st7-${today}`,e:"🔥",title:"7-day streak!",sub:"Amazing consistency — keep it up!",t:"Now"});
-  return out;
-}
 
-const smartNotifIdToInt=(id)=>{
-  const s=String(id||"");
-  let hash=0;
-  for(let i=0;i<s.length;i++)hash=((hash<<5)-hash)+s.charCodeAt(i);
-  return Math.abs(hash%900000)+100000;
-};
+  if(meals.length>0&&protein>=tP&&carbs>=tC&&fat>=tF){
+    out.push({id:`macro-win-${today}`,e:"⚡",title:"Macro balance win!",sub:`Protein ${Math.round(protein)}g, Carbs ${Math.round(carbs)}g, Fat ${Math.round(fat)}g — all targets met.`,t:"Today"});
+  }
 
-async function pushSmartAlertsToSystem(notifications){
-  if(!isNativeApp()||!Array.isArray(notifications)||!notifications.length)return;
   try{
-    const sent=new Set(readSentSmartNotifIds());
-    const unsent=notifications.filter(n=>n?.id&&!sent.has(n.id));
-    if(!unsent.length)return;
+    const last7=dateRangeInclusive(today,7);
+    let bestDay={d:null,cal:0};
+    let sum=0,days=0,waterGood=0,onTargetDays=0;
+    for(const d of last7){
+      const dayData=loadLocalDay(user.id,d);
+      const dayMeals=Array.isArray(dayData?.meals)?dayData.meals:[];
+      const dayWater=+dayData?.water||0;
+      const dayCal=dayMeals.reduce((a,m)=>a+(+m.cal||0),0);
+      if(dayCal>0){
+        days++;
+        sum+=dayCal;
+        if(dayCal>bestDay.cal)bestDay={d,cal:dayCal};
+        if(dayCal>=tgt*.95&&dayCal<=tgt*1.05)onTargetDays++;
+      }
+      if(dayWater>=8)waterGood++;
+    }
+    if(days>0){
+      const avg=Math.round(sum/days);
+      const bestLabel=bestDay?.d?new Date(bestDay.d+"T12:00:00").toLocaleDateString("en-IN",{weekday:"short"}):"—";
+      out.push({id:`week-summary-${today}`,e:"📊",title:"Weekly summary",sub:`Best day: ${bestLabel} (${Math.round(bestDay.cal)} kcal) · Avg: ${avg} kcal · Water consistency: ${waterGood}/7 days.`,t:"This week"});
 
-    const perm=await LocalNotifications.requestPermissions();
-    if(perm.display!=="granted")return;
+      const pbKey=`nutriscan_personal_bests_${user.id}`;
+      let bests={longestStreak:0,bestOnTargetWeek:0};
+      try{bests=JSON.parse(localStorage.getItem(pbKey)||"{}")||{};}catch(e){}
+      let changed=false;
+      if((streak||0)>(+bests.longestStreak||0)){
+        bests.longestStreak=streak;
+        changed=true;
+        out.push({id:`pb-streak-${today}`,e:"🏆",title:"New personal best: longest streak",sub:`You've set a new best streak at ${streak} days.`,t:"Today"});
+      }
+      if(onTargetDays>(+bests.bestOnTargetWeek||0)){
+        bests.bestOnTargetWeek=onTargetDays;
+        changed=true;
+        out.push({id:`pb-target-${today}`,e:"🌟",title:"New personal best: on-target week",sub:`${onTargetDays} on-target days in the last 7 days — your best so far.`,t:"This week"});
+      }
+      if(changed){
+        try{localStorage.setItem(pbKey,JSON.stringify(bests));}catch(e){}
+      }
+    }
+  }catch(e){}
 
-    await LocalNotifications.createChannel({
-      id:SMART_NOTIF_CHANNEL_ID,
-      name:"Smart alerts",
-      description:"NutriScan progress and tracking alerts",
-      importance:4,
-      visibility:1,
-    });
-
-    const toSchedule=unsent.slice(0,2).map((n,idx)=>({
-      id:smartNotifIdToInt(n.id),
-      title:n?.title||"NutriScan Alert",
-      body:n?.sub||"Open NutriScan to view details",
-      channelId:SMART_NOTIF_CHANNEL_ID,
-      schedule:{at:new Date(Date.now()+1200+(idx*400))},
-      extra:{smartId:String(n.id||"")},
-    }));
-
-    await LocalNotifications.schedule({notifications:toSchedule});
-    toSchedule.forEach((_,i)=>sent.add(unsent[i].id));
-    writeSentSmartNotifIds(Array.from(sent).slice(-300));
-  }catch(e){
-    logAppError(e,"notifications.smart_system_push");
-  }
+  return out;
 }
 
 /* ══════════════ SPLASH SCREEN ══════════════ */
@@ -3334,30 +3521,24 @@ export default function App(){
     return()=>{cancel=true;};
   },[user?.id,user?.token,meals]);
 
-  const smartNotifs=useMemo(()=>(user?buildSmartNotifications({user,meals,water,streak:mealStreak}):[]),[user,meals,water,mealStreak]);
-  const notifications=useMemo(()=>smartNotifs.map(n=>({...n,unread:!readNotifIds.has(n.id)})),[smartNotifs,readNotifIds]);
+  const inAppNotifs=useMemo(()=>(user&&settings.achievementAlerts?buildInAppProgressNotifications({user,meals,water,streak:mealStreak}):[]),[user,settings.achievementAlerts,meals,water,mealStreak]);
+  const notifications=useMemo(()=>inAppNotifs.map(n=>({...n,unread:!readNotifIds.has(n.id)})),[inAppNotifs,readNotifIds]);
   const hasUnreadNotifs=notifications.some(n=>n.unread);
 
-  useEffect(()=>{
-    if(screen!=="app"||!user?.id)return;
-    const unread=(notifications||[]).filter(n=>n.unread);
-    if(!unread.length)return;
-    pushSmartAlertsToSystem(unread);
-  },[screen,user?.id,notifications]);
   const openNotifs=useCallback(()=>{
-    const raw=user?buildSmartNotifications({user,meals,water,streak:mealStreak}):[];
+    const raw=user&&settings.achievementAlerts?buildInAppProgressNotifications({user,meals,water,streak:mealStreak}):[];
     setReadNotifIds(prev=>{const n=new Set(prev);raw.forEach(x=>{if(x.id)n.add(x.id);});return n;});
     setShowNot(true);
-  },[user,meals,water,mealStreak]);
+  },[user,settings.achievementAlerts,meals,water,mealStreak]);
   const markAllNotifsRead=useCallback(()=>{
-    const raw=user?buildSmartNotifications({user,meals,water,streak:mealStreak}):[];
+    const raw=user&&settings.achievementAlerts?buildInAppProgressNotifications({user,meals,water,streak:mealStreak}):[];
     setReadNotifIds(prev=>{const n=new Set(prev);raw.forEach(x=>{if(x.id)n.add(x.id);});return n;});
-  },[user,meals,water,mealStreak]);
+  },[user,settings.achievementAlerts,meals,water,mealStreak]);
 
   useEffect(()=>{
     if(screen!=="app"||!user?.id)return;
-    syncMealWaterReminders({mealReminders:settings.mealReminders,waterReminders:settings.waterReminders});
-  },[screen,user?.id,settings.mealReminders,settings.waterReminders]);
+    syncMealWaterReminders({mealReminders:settings.mealReminders,waterReminders:settings.waterReminders,meals,water});
+  },[screen,user?.id,settings.mealReminders,settings.waterReminders,meals,water]);
 
   /* ── Persist water to Supabase (queue when offline) ── */
   const setWaterAndSave=async(val)=>{
@@ -3428,7 +3609,7 @@ export default function App(){
   useEffect(()=>{
     const prev=prevMealStreakRef.current||0;
     const cur=mealStreak||0;
-    if(cur>prev&&settings.achievementAlerts&&[7,14,30].includes(cur)){
+    if(cur>prev&&settings.achievementAlerts&&[3,7,14,30].includes(cur)){
       playAppSfx("achievement");
     }
     prevMealStreakRef.current=cur;

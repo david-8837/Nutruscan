@@ -12,7 +12,7 @@ const cors = {
 
 const TEXT_MODEL =
   Deno.env.get("OPENROUTER_MODEL") ||
-  "trinity-large-preview:free";
+  "arcee-ai/trinity-large-preview:free";
 const TEXT_FALLBACK_MODEL =
   Deno.env.get("OPENROUTER_FALLBACK_MODEL") ||
   "google/gemini-2.0-flash-001";
