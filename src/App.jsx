@@ -1371,6 +1371,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const [mealBase,setMealBase]=useState(null);
   const [mealServingGrams,setMealServingGrams]=useState("100");
   const [dashWeightDelta,setDashWeightDelta]=useState(null);
+  const [totalCaloriesAllTime,setTotalCaloriesAllTime]=useState(0);
   const [sportSensorLoading,setSportSensorLoading]=useState(true);
   const [sportSensorReady,setSportSensorReady]=useState(true);
   const [sportSensorReason,setSportSensorReason]=useState(null);
@@ -1406,7 +1407,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const selectedDateMealsTitle=selectedDateLabel==="Today"?"Today's Meals":`${selectedDateLabel}'s Meals`;
   const selectedDateIntakeTitle=selectedDateLabel==="Today"?"Today's Intake":`${selectedDateLabel} Intake`;
   const isSelectedDateSyncing=String(isSyncingDate||"").slice(0,10)===String(selectedDate||"").slice(0,10);
-  const groups=["Breakfast","Lunch","Snack","Dinner"].map(n=>({n,items:meals.filter(m=>m.m===n),emoji:{Breakfast:"🌅",Lunch:"☀️",Snack:"🍎",Dinner:"🌙"}[n]}));
+  const groups=["Breakfast","Lunch","Snack","Dinner"].map(n=>({n,items:meals.filter(m=>m.m===n),icon:{Breakfast:Ic.sun,Lunch:Ic.food,Snack:Ic.heart,Dinner:Ic.moon}[n]}));
   const addRec=r=>{setMeals(p=>[...p,{id:Date.now(),name:r.n,cal:r.c,p:r.p||0,c:r.carb||0,f:r.f||0,t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),e:r.e,m:"Snack"}]);playSfx&&playSfx("success");toast(`${r.n} added!`,"✅");setSheet(null);};
   const mealDetailPreview=useMemo(()=>{
     if(!mealView)return null;
@@ -1437,13 +1438,27 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
     return()=>{cancel=true;};
   },[user?.id,user?.token,user?.weight]);
 
+  useEffect(()=>{
+    if(!user?.token||!user?.id){setTotalCaloriesAllTime(0);return;}
+    let cancel=false;
+    (async()=>{
+      try{
+        const rows=await supa.select(user.token,"meals","calories",`&user_id=eq.${user.id}`);
+        if(cancel||!Array.isArray(rows))return;
+        const total=Math.round(rows.reduce((sum,row)=>sum+(+row?.calories||0),0));
+        setTotalCaloriesAllTime(total);
+      }catch(e){if(!cancel)setTotalCaloriesAllTime(0);}
+    })();
+    return()=>{cancel=true;};
+  },[user?.id,user?.token]);
+
   const HEART=[{t:"00:00",bpm:62},{t:"06:00",bpm:68},{t:"08:00",bpm:95},{t:"12:00",bpm:82},{t:"15:00",bpm:88},{t:"18:00",bpm:92},{t:"20:00",bpm:74},{t:"00:00",bpm:64}];
   const SLEEP=[{d:"Mon",h:7.2},{d:"Tue",h:6.8},{d:"Wed",h:8.1},{d:"Thu",h:7.5},{d:"Fri",h:6.5},{d:"Sat",h:8.8},{d:"Sun",h:7.9}];
   const SPORT=[
-    {name:"Steps",val:animatedSteps,max:10000,icon:"👟",color:T.mint,fmt:v=>v},
-    {name:"Calories",val:sportData.calories,max:600,icon:"🔥",color:T.pink,fmt:v=>v},
-    {name:"Active Min",val:sportData.activeMinutes,max:90,icon:"⏱️",color:T.lav,fmt:v=>v},
-    {name:"Distance",val:sportData.distanceKm,max:8,icon:"📍",color:T.peach,fmt:v=>v.toFixed(1)},
+    {name:"Steps",val:animatedSteps,max:10000,icon:Ic.run,color:T.mint,fmt:v=>v},
+    {name:"Calories",val:sportData.calories,max:600,icon:Ic.trendUp,color:T.pink,fmt:v=>v},
+    {name:"Active Min",val:sportData.activeMinutes,max:90,icon:Ic.notification,color:T.lav,fmt:v=>v},
+    {name:"Distance",val:sportData.distanceKm,max:8,icon:Ic.trend,color:T.peach,fmt:v=>v.toFixed(1)},
   ];
 
   useEffect(()=>{
@@ -1532,7 +1547,6 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
         <div><p style={{fontSize:12,color:T.light,fontWeight:600,lineHeight:1}}>{greeting},</p><p style={{fontSize:18,fontWeight:900,lineHeight:1.3}}>{user.name}</p></div>
       </div>
       <div style={{display:"flex",gap:9}}>
-        <button className="btn-icon" onClick={showSearch}>{Ic.search}</button>
         <div style={{position:"relative"}}><button className="btn-icon" onClick={openNotifs}>{Ic.bell}</button>{hasUnreadNotifs&&<div style={{position:"absolute",top:8,right:8,width:8,height:8,borderRadius:"50%",background:T.red,border:`2px solid ${T.white}`}}/>}</div>
       </div>
     </div>
@@ -1552,16 +1566,16 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
           ))}
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:12}}>
-          <button className="badge" style={{background:T.white,color:T.mid,border:"none",cursor:"pointer",fontFamily:"Nunito",display:"inline-flex",alignItems:"center",gap:6}} onClick={()=>setSheet("dateMenu")}>
-            {isSelectedDateSyncing&&<span className="aSpin" style={{display:"inline-block",width:12,height:12,border:`2px solid ${T.border}`,borderTop:`2px solid ${T.purple}`,borderRadius:"50%"}}/>}
-            <span>{selectedDateLabel} ▾</span>
-          </button>
+          <div className="badge" style={{background:T.white,color:T.mid,border:"none",fontFamily:"Nunito",display:"inline-flex",alignItems:"center",gap:6}}>
+            <span style={{display:"inline-flex",color:T.purple}}>{Ic.trendUp}</span>
+            <span>Total calories eaten: {totalCaloriesAllTime} kcal</span>
+          </div>
           <span style={{fontSize:13,fontWeight:700,color:left>0?T.green:T.red}}>{left>0?`${left} remaining`:`${Math.abs(left)} over`}</span>
         </div>
       </div>
       {/* 4-grid */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-        {[{title:"Sport Data",sub:`${sportData.steps} steps · ${sportData.distanceKm.toFixed(1)} km`,icon:"📊",bg:T.peachBg,key:"sport"},{title:"Hydration",sub:`${water}/8 glasses · ${water*250}ml`,icon:"💧",bg:T.lavBg,key:"hydration"},{title:"Sleep Quality",sub:"Check Your Sleep Quality",icon:"😴",bg:T.mintBg,key:"sleep"},{title:"BMI",sub:`BMI: ${bmi} — ${bi.l}`,icon:"⚖️",bg:T.pinkBg,key:"bmi"}].map(c=>(
+        {[{title:"Sport Data",sub:`${sportData.steps} steps · ${sportData.distanceKm.toFixed(1)} km`,icon:Ic.chart,bg:T.peachBg,key:"sport"},{title:"Hydration",sub:`${water}/8 glasses · ${water*250}ml`,icon:Ic.drop,bg:T.lavBg,key:"hydration"},{title:"Sleep Quality",sub:"Check Your Sleep Quality",icon:Ic.moon,bg:T.mintBg,key:"sleep"},{title:"BMI",sub:`BMI: ${bmi} — ${bi.l}`,icon:Ic.user,bg:T.pinkBg,key:"bmi"}].map(c=>(
           <div key={c.key} className="pcard hover-card" style={{background:c.bg,padding:"16px"}} onClick={()=>setSheet(c.key)}>
                         <div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:36,height:36,borderRadius:10,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,boxShadow:`0 2px 6px ${T.shadow}`}}>{c.icon}</div><div style={{width:26,height:26,borderRadius:8,background:isDark?"rgba(108,168,255,.22)":"rgba(255,255,255,.6)",display:"flex",alignItems:"center",justifyContent:"center",color:isDark?T.blue:T.mid,border:isDark?`1px solid ${T.blue}55`:"none"}}>{Ic.trend}</div></div>
             <p style={{fontSize:14,fontWeight:800,marginTop:12,lineHeight:1.2}}>{c.title}</p>
@@ -1584,7 +1598,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
         <div className="card hover-card" style={{padding:"16px"}} onClick={showAwards}>
           <p style={{fontSize:13,fontWeight:800,marginBottom:4}}>Achievement</p>
           <p style={{fontSize:11,color:T.light,lineHeight:1.4,fontWeight:500,marginBottom:10}}>View your milestones and rewards.</p>
-          <div style={{height:58,borderRadius:12,background:`linear-gradient(135deg,${T.lavBg},${T.mintBg})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:32}}>🏆</div>
+          <div style={{height:58,borderRadius:12,background:`linear-gradient(135deg,${T.lavBg},${T.mintBg})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:32,color:T.purple}}>{Ic.trophy}</div>
           <button className="btn btn-primary" style={{marginTop:10,borderRadius:12,padding:"10px 14px",fontSize:13}} onClick={e=>{e.stopPropagation();showAwards();}}>Open</button>
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:10}}>
@@ -1610,9 +1624,9 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       <div>
         <div className="sec-hdr"><p className="sec-title">{selectedDateMealsTitle}</p><button className="sec-link" onClick={()=>setTab("scanner")}>+ Add</button></div>
         {groups.map(g=>g.items.length>0&&<div key={g.n} style={{marginBottom:14}}>
-          <p style={{fontSize:11,fontWeight:700,color:T.light,textTransform:"uppercase",letterSpacing:1.1,marginBottom:8}}>{g.emoji} {g.n}</p>
+          <p style={{fontSize:11,fontWeight:700,color:T.light,textTransform:"uppercase",letterSpacing:1.1,marginBottom:8,display:"inline-flex",alignItems:"center",gap:6}}><span>{g.icon}</span> {g.n}</p>
           {g.items.map(m=><div key={m.id} className="meal-row" style={{marginBottom:8}} onClick={()=>{setMealView(m);setMealBase(m);setMealServingGrams(String(Math.max(1,Math.round(Number(m?.serving_g)||100))));setSheet("mealDetail");}}>
-            <div style={{width:44,height:44,borderRadius:13,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,boxShadow:`0 2px 8px ${T.shadow}`}}>{m.e}</div>
+            <div style={{width:44,height:44,borderRadius:13,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,boxShadow:`0 2px 8px ${T.shadow}`}}>{Ic.food}</div>
             <div style={{flex:1}}><p style={{fontSize:14,fontWeight:700}}>{m.name}</p><p style={{fontSize:11,color:T.light,marginTop:2}}>P:{m.p}g · C:{m.c}g · F:{m.f}g</p></div>
             <div style={{textAlign:"right"}}><p style={{fontSize:15,fontWeight:900,color:T.purple}}>{m.cal}</p><p style={{fontSize:10,color:T.light}}>kcal</p></div>
           </div>)}
@@ -1625,7 +1639,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
         <div className="sec-hdr"><p className="sec-title">Today Recommendation</p><button className="sec-link" onClick={()=>setSheet("allRecs")}>See all</button></div>
         <div style={{display:"flex",gap:12,overflowX:"auto",paddingBottom:4}}>
           {RECS.slice(0,4).map((r,i)=><div key={i} className="hover-card" style={{minWidth:128,padding:"16px",borderRadius:20,background:r.bg,flexShrink:0,boxShadow:`0 3px 10px ${T.shadow}`}} onClick={()=>addRec(r)}>
-            <div style={{fontSize:36,marginBottom:10}}>{r.e}</div>
+            <div style={{fontSize:36,marginBottom:10,color:T.purple}}>{Ic.food}</div>
             <p style={{fontSize:14,fontWeight:800,color:LIGHT.navy}}>{r.n}</p>
             <p style={{fontSize:12,color:LIGHT.mid,fontWeight:700,marginTop:3}}>{r.c} kcal</p>
             <div style={{fontSize:10,color:LIGHT.purple,fontWeight:700,marginTop:6}}>Tap to add +</div>
@@ -1634,8 +1648,8 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       </div>
       {/* Bottom sport+hydration */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:4}}>
-        <div className="pcard hover-card" style={{background:T.peachBg,padding:"16px"}} onClick={()=>setSheet("sport")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📊</div><div style={{color:isDark?T.blue:T.mid}}>{Ic.trend}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Sport Data</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{sportData.steps} steps · {sportData.activeMinutes} min active</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
-        <div className="pcard hover-card" style={{background:T.lavBg,padding:"16px"}} onClick={()=>setSheet("hydration")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>💧</div><div style={{color:T.purple}}>{Ic.drop}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Hydration</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{water}/8 glasses · {water*250}ml</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
+        <div className="pcard hover-card" style={{background:T.peachBg,padding:"16px"}} onClick={()=>setSheet("sport")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{Ic.chart}</div><div style={{color:isDark?T.blue:T.mid}}>{Ic.trend}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Sport Data</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{sportData.steps} steps · {sportData.activeMinutes} min active</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
+        <div className="pcard hover-card" style={{background:T.lavBg,padding:"16px"}} onClick={()=>setSheet("hydration")}><div style={{display:"flex",justifyContent:"space-between"}}><div style={{width:32,height:32,borderRadius:9,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{Ic.drop}</div><div style={{color:T.purple}}>{Ic.drop}</div></div><p style={{fontSize:14,fontWeight:800,marginTop:10}}>Hydration</p><p style={{fontSize:11,color:T.mid,fontWeight:500,marginTop:3,lineHeight:1.4}}>{water}/8 glasses · {water*250}ml</p><button className="check-link" style={{marginTop:12}}>Check {Ic.arrowR}</button></div>
       </div>
     </div>
 
