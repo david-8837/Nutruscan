@@ -1,11 +1,13 @@
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo, useLayoutEffect } from "react";
 import { Capacitor } from "@capacitor/core";
 import { App as CapacitorApp } from "@capacitor/app";
 import { Browser } from "@capacitor/browser";
 import { StatusBar, Style as StatusBarStyle } from "@capacitor/status-bar";
 import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
+import { CameraPreview } from "@capacitor-community/camera-preview";
 import { LocalNotifications } from "@capacitor/local-notifications";
-import { syncMealWaterReminders } from "./reminders.js";
+import { syncMealWaterReminders, scheduleDailyReminderExample } from "./reminders.js";
+import { startNativeStepCounter, supportsNativeStepCounter } from "./stepCounter.js";
 import { logAppError } from "./monitoring.js";
 import { playSfx } from "./sound.js";
 import {
@@ -36,7 +38,11 @@ const OPENROUTER_KEY = (import.meta.env.VITE_OPENROUTER_API_KEY || "").trim();
 const OPENROUTER_TEXT_MODEL = "arcee-ai/trinity-large-preview:free";
 const WEB3FORMS_ACCESS_KEY = (import.meta.env.VITE_WEB3FORMS_ACCESS_KEY || "").trim();
 const WEB3FORMS_ENDPOINT = "https://api.web3forms.com/submit";
+const CLOUDINARY_CLOUD_NAME = (import.meta.env.VITE_CLOUDINARY_CLOUD_NAME || "").trim();
+const CLOUDINARY_UPLOAD_PRESET = (import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET || "nutriscan_profiles").trim();
 const FOOD_SEARCH_CACHE = new Map(); // Cache food search results to reduce latency
+const FOOD_SEARCH_CACHE_KEY = "nutriscan_food_search_cache_v1";
+const FOOD_SEARCH_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const OPENFOOD_FN_URL = `${SUPA_URL}/functions/v1/openfood`;
 const PROFILE_IMAGE_BUCKET = "profile-images";
 const OAUTH_REDIRECT_URI = "com.nutriscan.app://login-callback";
@@ -91,6 +97,32 @@ const base64ToBlob=(base64,mime="application/octet-stream")=>{
   const bytes=new Uint8Array(len);
   for(let i=0;i<len;i++)bytes[i]=binary.charCodeAt(i);
   return new Blob([bytes],{type:mime});
+};
+
+const uploadProfileImageToCloudinary=async(blob,filename)=>{
+  if(!CLOUDINARY_CLOUD_NAME){
+    throw new Error("Cloudinary not configured. Please set VITE_CLOUDINARY_CLOUD_NAME in .env");
+  }
+  const formData=new FormData();
+  formData.append("file",blob,filename);
+  formData.append("upload_preset",CLOUDINARY_UPLOAD_PRESET);
+  formData.append("folder","nutriscan/profiles");
+  try{
+    const response=await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,{
+      method:"POST",
+      body:formData,
+    });
+    if(!response.ok){
+      const err=await response.json();
+      throw new Error(err.error?.message||"Cloudinary upload failed");
+    }
+    const data=await response.json();
+    const secureUrl=String(data?.secure_url||"").trim();
+    if(!secureUrl)throw new Error("Cloudinary upload succeeded but secure URL is missing");
+    return secureUrl;
+  }catch(e){
+    throw new Error(`Upload failed: ${e.message}`);
+  }
 };
 
 const applyNativeStatusBar=async({bgColor,useTransparent,forceStyle})=>{
@@ -181,6 +213,12 @@ const supa = {
   async patch(token,table,filter,patch){
     const r=await fetch(`${SUPA_URL}/rest/v1/${table}?${filter}`,{method:"PATCH",headers:{...this._h(token),Prefer:"return=minimal"},body:JSON.stringify(patch)});
     return r.ok;
+  },
+  async rpc(token,fn,payload={}){
+    const r=await fetch(`${SUPA_URL}/rest/v1/rpc/${fn}`,{method:"POST",headers:this._h(token),body:JSON.stringify(payload)});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(data?.message||data?.error||`${fn} ${r.status}`);
+    return data;
   },
   storagePublicUrl(bucket,path){
     return `${SUPA_URL}/storage/v1/object/public/${encodeURIComponent(bucket)}/${String(path||"").split("/").map(encodeURIComponent).join("/")}`;
@@ -371,18 +409,54 @@ const loadLocalDay=(uid,day)=>{
     return{meals:m?JSON.parse(m):null,water:w!=null?+w:null};
   }catch(e){return{meals:null,water:null};}
 };
+const normalizeMealList=(mealsArr=[])=>{
+  const seen=new Set();
+  const out=[];
+  for(const meal of Array.isArray(mealsArr)?mealsArr:[]){
+    const key=meal?.id!=null
+      ?`id:${meal.id}`
+      :`k:${String(meal?.name||"").trim().toLowerCase()}|${Number(meal?.cal||0)}|${Number(meal?.p||0)}|${Number(meal?.c||0)}|${Number(meal?.f||0)}|${String(meal?.m||"").trim().toLowerCase()}|${String(meal?.t||"").trim()}`;
+    if(seen.has(key))continue;
+    seen.add(key);
+    out.push(meal);
+  }
+  return out;
+};
+const dayStateEquals=(aMeals,aWater,bMeals,bWater)=>{
+  const am=normalizeMealList(aMeals||[]);
+  const bm=normalizeMealList(bMeals||[]);
+  if(am.length!==bm.length)return false;
+  for(let i=0;i<am.length;i++){
+    const a=am[i]||{};
+    const b=bm[i]||{};
+    if(String(a.id||"")!==String(b.id||""))return false;
+    if(String(a.name||"")!==String(b.name||""))return false;
+    if(Number(a.cal||0)!==Number(b.cal||0))return false;
+    if(Number(a.p||0)!==Number(b.p||0))return false;
+    if(Number(a.c||0)!==Number(b.c||0))return false;
+    if(Number(a.f||0)!==Number(b.f||0))return false;
+    if(String(a.e||"")!==String(b.e||""))return false;
+    if(String(a.m||"")!==String(b.m||""))return false;
+    if(String(a.t||"")!==String(b.t||""))return false;
+  }
+  return Number(aWater||0)===Number(bWater||0);
+};
 const sportDayKey=(uid,day)=>`nutriscan_sport_${uid}_${day}`;
+const sportStepStateKey=(uid)=>`nutriscan_step_state_${uid}`;
+const deriveSportMetrics=(stepsRaw)=>{
+  const steps=Math.max(0,Math.round(+stepsRaw||0));
+  const distanceKm=Math.round((steps*0.0008)*100)/100;
+  const calories=Math.round(steps*0.04);
+  const activeMinutes=Math.round(steps/100);
+  return{steps,distanceKm,calories,activeMinutes};
+};
 const readSportDay=(uid,day)=>{
   try{
-    if(!uid||!day)return{steps:0,distanceKm:0,calories:0,activeMinutes:0};
+    if(!uid||!day)return deriveSportMetrics(0);
     const raw=JSON.parse(localStorage.getItem(sportDayKey(uid,day))||"{}");
-    const steps=Math.max(0,Math.round(+raw.steps||0));
-    const distanceKm=Math.round((steps*0.00078)*100)/100;
-    const calories=Math.round(steps*0.04);
-    const activeMinutes=Math.round(steps/100);
-    return{steps,distanceKm,calories,activeMinutes};
+    return deriveSportMetrics(raw.steps);
   }catch(e){
-    return{steps:0,distanceKm:0,calories:0,activeMinutes:0};
+    return deriveSportMetrics(0);
   }
 };
 const writeSportDay=(uid,day,steps)=>{
@@ -392,24 +466,69 @@ const writeSportDay=(uid,day,steps)=>{
     localStorage.setItem(sportDayKey(uid,day),JSON.stringify({steps:safeSteps,updatedAt:new Date().toISOString()}));
   }catch(e){}
 };
+const readSportStepState=(uid)=>{
+  try{
+    if(!uid)return{baselineSteps:null,lastSavedDate:null,lastTotalSteps:null};
+    const raw=JSON.parse(localStorage.getItem(sportStepStateKey(uid))||"{}");
+    const baselineSteps=Number.isFinite(+raw.baselineSteps)?Math.max(0,Math.round(+raw.baselineSteps)):null;
+    const lastTotalSteps=Number.isFinite(+raw.lastTotalSteps)?Math.max(0,Math.round(+raw.lastTotalSteps)):null;
+    const lastSavedDate=raw.lastSavedDate?String(raw.lastSavedDate):null;
+    return{baselineSteps,lastTotalSteps,lastSavedDate};
+  }catch(e){
+    return{baselineSteps:null,lastSavedDate:null,lastTotalSteps:null};
+  }
+};
+const writeSportStepState=(uid,{baselineSteps,lastTotalSteps,lastSavedDate})=>{
+  try{
+    if(!uid)return;
+    localStorage.setItem(sportStepStateKey(uid),JSON.stringify({
+      baselineSteps:Number.isFinite(+baselineSteps)?Math.max(0,Math.round(+baselineSteps)):0,
+      lastTotalSteps:Number.isFinite(+lastTotalSteps)?Math.max(0,Math.round(+lastTotalSteps)):0,
+      lastSavedDate:lastSavedDate?String(lastSavedDate):ymdLocal(new Date()),
+      updatedAt:new Date().toISOString(),
+    }));
+  }catch(e){}
+};
+const resolveTodaySportSteps=(uid,day,totalSteps)=>{
+  if(!uid||!day)return 0;
+  const safeTotal=Math.max(0,Math.round(+totalSteps||0));
+  const prev=readSportStepState(uid);
+  let baseline=prev.baselineSteps;
+  if(!Number.isFinite(+baseline)||prev.lastSavedDate!==day||safeTotal<+baseline){
+    baseline=safeTotal;
+  }
+  const todaySteps=Math.max(0,safeTotal-+baseline);
+  writeSportStepState(uid,{baselineSteps:baseline,lastTotalSteps:safeTotal,lastSavedDate:day});
+  writeSportDay(uid,day,todaySteps);
+  return todaySteps;
+};
 const readOfflineQueue=()=>{try{return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY)||"[]");}catch(e){return[];}};
 const writeOfflineQueue=q=>{try{localStorage.setItem(OFFLINE_QUEUE_KEY,JSON.stringify(q));}catch(e){}};
 const enqueueOffline=o=>{const q=readOfflineQueue();q.push(o);writeOfflineQueue(q);};
 async function flushOfflineQueue(user,toastFn){
   if(!user?.token||!netOnline())return;
-  const q=readOfflineQueue();
-  if(!q.length)return;
-  const failed=[];
-  for(const op of q){
+  const queue=readOfflineQueue();
+  if(!queue.length)return;
+  const checkpointKey=`nutriscan_sync_checkpoint_${user.id}`;
+  let synced=0;
+  for(let i=0;i<queue.length;i++){
+    const op=queue[i];
     try{
       if(op.kind==="meal")await supa.insert(user.token,"meals",op.payload);
       else if(op.kind==="meal-delete")await supa.del(user.token,"meals",`id=eq.${encodeURIComponent(op.payload?.id)}&user_id=eq.${user.id}`);
       else if(op.kind==="water")await supa.upsert(user.token,"water_logs",op.payload);
       else if(op.kind==="settings")await supa.upsert(user.token,"settings",op.payload);
-    }catch(e){failed.push(op);}
+      synced=i+1;
+      try{localStorage.setItem(checkpointKey,String(synced));}catch(_e){}
+      writeOfflineQueue(queue.slice(i+1));
+    }catch(e){
+      logAppError(e,"offline_queue_flush_failed");
+      writeOfflineQueue(queue.slice(i));
+      return;
+    }
   }
-  writeOfflineQueue(failed);
-  if(q.length&&!failed.length&&toastFn)toastFn("Offline changes synced","✅");
+  writeOfflineQueue([]);
+  if(queue.length&&synced===queue.length&&toastFn)toastFn("Offline changes synced","✅");
 }
 
 
@@ -573,12 +692,28 @@ select.inp option{background:var(--white);}
 /* Scan line */
 .scan-line{position:absolute;left:5%;right:5%;height:2px;background:linear-gradient(90deg,transparent,var(--purple),transparent);box-shadow:0 0 14px var(--lav);animation:scan 2.2s linear infinite;}
 
+/* Scanner premium UI */
+.scan-hero{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:14px 14px 12px;border-radius:20px;background:linear-gradient(135deg,var(--white),var(--lavBg));border:1px solid var(--border);box-shadow:0 6px 20px var(--shadow);}
+.scan-live-pill{display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:999px;background:var(--mintBg);border:1px solid rgba(34,197,94,.2);}
+.scan-mode-wrap{display:flex;gap:8px;margin-bottom:16px;overflow-x:auto;padding:6px;background:var(--white);border:1px solid var(--border);border-radius:16px;box-shadow:0 4px 14px var(--shadow);}
+.scan-mode-btn{padding:9px 14px;border-radius:12px;font-family:'Nunito',sans-serif;font-size:12px;font-weight:800;cursor:pointer;border:none;transition:all .2s;white-space:nowrap;flex-shrink:0;}
+.scan-mode-btn.on{background:var(--navy);color:var(--white);box-shadow:0 6px 14px rgba(28,28,46,.18);}
+.scan-mode-btn.off{background:transparent;color:var(--mid);}
+.scan-shell{border:1px solid var(--border);box-shadow:0 8px 24px var(--shadow);border-radius:20px;}
+.camera-frame{border-radius:16px;overflow:hidden;aspect-ratio:4/3;background:#000;margin-bottom:12px;position:relative;border:1px solid rgba(255,255,255,.1);box-shadow:inset 0 0 0 1px rgba(255,255,255,.05);}
+.scan-hud{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.72);backdrop-filter:blur(8px);border-radius:20px;padding:6px 16px;display:flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.12);}
+.scan-idle-dark{background:linear-gradient(145deg,#11182A,#1B2136)!important;border:1px solid rgba(255,255,255,.12)!important;box-shadow:0 14px 32px rgba(10,14,26,.35)!important;color:var(--white)!important;}
+.scan-idle-sub{color:rgba(255,255,255,.72)!important;}
+.scan-idle-icon{font-size:34px;line-height:1;opacity:.9;margin-bottom:10px;display:inline-block;filter:drop-shadow(0 4px 10px rgba(168,85,247,.2));}
+
 /* Bottom nav */
-.bnav{position:fixed;bottom:0;left:0;right:0;width:100%;background:var(--white);border-radius:28px 28px 0 0;padding:10px 12px env(safe-area-inset-bottom,16px);display:flex;box-shadow:0 -3px 20px var(--shadow);z-index:200;}
-.nb{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;border:none;background:transparent;cursor:pointer;padding:4px 2px;font-family:'Nunito',sans-serif;font-size:10px;font-weight:700;color:var(--light);transition:color .2s;}
+.bnav{position:fixed;bottom:0;left:0;right:0;width:100%;background:var(--white);border-radius:28px 28px 0 0;padding:10px 12px env(safe-area-inset-bottom,16px);display:flex;box-shadow:0 -3px 20px var(--shadow);z-index:200;overflow:hidden;}
+.bnav-indicator{position:absolute;left:0;top:0;border-radius:12px;background:var(--navy);pointer-events:none;z-index:0;opacity:0;transition:transform .4s ease-in-out,width .4s ease-in-out,height .4s ease-in-out,opacity .24s ease-in-out;will-change:transform,width,height;}
+.bnav-indicator.ready{opacity:1;}
+.nb{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;border:none;background:transparent;cursor:pointer;padding:4px 2px;font-family:'Nunito',sans-serif;font-size:10px;font-weight:700;color:var(--light);transition:color .4s ease-in-out;position:relative;z-index:1;}
 .nb.active{color:var(--navy);}
-.nb-icon{width:50px;height:34px;border-radius:12px;display:flex;align-items:center;justify-content:center;transition:background .2s;}
-.nb.active .nb-icon{background:var(--navy);}
+.nb-icon{width:50px;height:34px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:transparent;}
+.nb-icon svg{transition:stroke .4s ease-in-out;}
 
 
 /* Overlay / Sheet / Modal */
@@ -695,6 +830,22 @@ const fBMIlabel=b=>b<18.5?{l:"Underweight",c:T.blue}:b<25?{l:"Normal",c:T.green}
 const ymdLocal=d=>{const x=new Date(d);const y=x.getFullYear(),m=String(x.getMonth()+1).padStart(2,"0"),da=String(x.getDate()).padStart(2,"0");return`${y}-${m}-${da}`;};
 const addDaysStr=(dateStr,delta)=>{const [y,m,d]=dateStr.split("-").map(Number);const dt=new Date(y,m-1,d);dt.setDate(dt.getDate()+delta);return ymdLocal(dt);};
 const dateRangeInclusive=(endStr,nDays)=>{const out=[];for(let i=nDays-1;i>=0;i--)out.push(addDaysStr(endStr,-i));return out;};
+const buildRelativeDateOptions=(todayStr,count=5)=>{
+  const out=[];
+  for(let i=0;i<count;i++){
+    const date=addDaysStr(todayStr,-i);
+    const label=i===0?"Today":i===1?"Yesterday":`${i} days ago`;
+    out.push({offset:i,date,label});
+  }
+  return out;
+};
+const formatSelectedDateLabel=(selectedDate,todayStr)=>{
+  const sd=String(selectedDate||"").slice(0,10);
+  if(!sd)return "Today";
+  if(sd===todayStr)return "Today";
+  if(sd===addDaysStr(todayStr,-1))return "Yesterday";
+  try{return new Date(`${sd}T12:00:00`).toLocaleDateString("en-IN",{day:"numeric",month:"short"});}catch(e){return sd;}
+};
 const macroTargets=tgt=>({tP:Math.round(tgt*.25/4),tC:Math.round(tgt*.5/4),tF:Math.round(tgt*.25/9)});
 function buildAnalyticsInsights({calByDate,proteinByDate,calTarget,streak,onTargetCount,weightMeta,goal}){
   const last7=dateRangeInclusive(ymdLocal(new Date()),7);
@@ -1212,18 +1363,20 @@ function ForgotPassword({onBack}){
 }
 
 /* ══════════════ DASHBOARD ══════════════ */
-function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,showSearch,openNotifs,hasUnreadNotifs,showAwards,playSfx}){
+function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,showSearch,openNotifs,hasUnreadNotifs,showAwards,playSfx,selectedDate,onSelectDate,isSyncingDate}){
   const [sheet,setSheet]=useState(null);
   const [weightLogVal,setWeightLogVal]=useState("");
   const [weightSaving,setWeightSaving]=useState(false);
   const [mealView,setMealView]=useState(null);
+  const [mealBase,setMealBase]=useState(null);
+  const [mealServingGrams,setMealServingGrams]=useState("100");
   const [dashWeightDelta,setDashWeightDelta]=useState(null);
-  const [sportTracking,setSportTracking]=useState(false);
+  const [sportSensorLoading,setSportSensorLoading]=useState(true);
   const [sportSensorReady,setSportSensorReady]=useState(true);
+  const [sportSensorReason,setSportSensorReason]=useState(null);
   const [sportData,setSportData]=useState({steps:0,distanceKm:0,calories:0,activeMinutes:0});
-  const motionHandlerRef=useRef(null);
-  const stepCountRef=useRef(0);
-  const peakStateRef=useRef({lastStepTs:0,prevMag:9.8});
+  const [animatedSteps,setAnimatedSteps]=useState(0);
+  const stepAnimRef=useRef(null);
   const isDark=T.bg==="#0F0F1A";
   const todayKey=ymdLocal(new Date());
   const greeting=useMemo(()=>{
@@ -1248,8 +1401,27 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const tP=Math.round(target*.25/4),tC=Math.round(target*.5/4),tF=Math.round(target*.25/9);
   const sP=meals.reduce((a,m)=>a+m.p,0),sC=meals.reduce((a,m)=>a+m.c,0),sF=meals.reduce((a,m)=>a+m.f,0);
   const bmi=parseFloat(fBMI(user.weight,user.height)),bi=fBMIlabel(bmi);
+  const selectedDateLabel=formatSelectedDateLabel(selectedDate,todayKey);
+  const selectedDateOptions=useMemo(()=>buildRelativeDateOptions(todayKey,5),[todayKey]);
+  const selectedDateMealsTitle=selectedDateLabel==="Today"?"Today's Meals":`${selectedDateLabel}'s Meals`;
+  const selectedDateIntakeTitle=selectedDateLabel==="Today"?"Today's Intake":`${selectedDateLabel} Intake`;
+  const isSelectedDateSyncing=String(isSyncingDate||"").slice(0,10)===String(selectedDate||"").slice(0,10);
   const groups=["Breakfast","Lunch","Snack","Dinner"].map(n=>({n,items:meals.filter(m=>m.m===n),emoji:{Breakfast:"🌅",Lunch:"☀️",Snack:"🍎",Dinner:"🌙"}[n]}));
   const addRec=r=>{setMeals(p=>[...p,{id:Date.now(),name:r.n,cal:r.c,p:r.p||0,c:r.carb||0,f:r.f||0,t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),e:r.e,m:"Snack"}]);playSfx&&playSfx("success");toast(`${r.n} added!`,"✅");setSheet(null);};
+  const mealDetailPreview=useMemo(()=>{
+    if(!mealView)return null;
+    const base=mealBase||mealView;
+    const grams=Math.max(1,Math.min(2000,parseFloat(mealServingGrams)||100));
+    const factor=grams/100;
+    return {
+      ...mealView,
+      cal:Math.max(0,Math.round((+base.cal||0)*factor)),
+      p:Math.max(0,Math.round((+base.p||0)*factor*10)/10),
+      c:Math.max(0,Math.round((+base.c||0)*factor*10)/10),
+      f:Math.max(0,Math.round((+base.f||0)*factor*10)/10),
+      serving_g:Math.round(grams),
+    };
+  },[mealBase,mealServingGrams,mealView]);
   useEffect(()=>{
     if(!user?.token||!user?.id){setDashWeightDelta(null);return;}
     let cancel=false;
@@ -1268,7 +1440,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   const HEART=[{t:"00:00",bpm:62},{t:"06:00",bpm:68},{t:"08:00",bpm:95},{t:"12:00",bpm:82},{t:"15:00",bpm:88},{t:"18:00",bpm:92},{t:"20:00",bpm:74},{t:"00:00",bpm:64}];
   const SLEEP=[{d:"Mon",h:7.2},{d:"Tue",h:6.8},{d:"Wed",h:8.1},{d:"Thu",h:7.5},{d:"Fri",h:6.5},{d:"Sat",h:8.8},{d:"Sun",h:7.9}];
   const SPORT=[
-    {name:"Steps",val:sportData.steps,max:10000,icon:"👟",color:T.mint,fmt:v=>v},
+    {name:"Steps",val:animatedSteps,max:10000,icon:"👟",color:T.mint,fmt:v=>v},
     {name:"Calories",val:sportData.calories,max:600,icon:"🔥",color:T.pink,fmt:v=>v},
     {name:"Active Min",val:sportData.activeMinutes,max:90,icon:"⏱️",color:T.lav,fmt:v=>v},
     {name:"Distance",val:sportData.distanceKm,max:8,icon:"📍",color:T.peach,fmt:v=>v.toFixed(1)},
@@ -1277,70 +1449,76 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
   useEffect(()=>{
     if(!user?.id){
       setSportData({steps:0,distanceKm:0,calories:0,activeMinutes:0});
+      setAnimatedSteps(0);
+      setSportSensorReason(null);
+      setSportSensorLoading(false);
       return;
     }
     const loaded=readSportDay(user.id,todayKey);
-    stepCountRef.current=loaded.steps;
     setSportData(loaded);
+    setAnimatedSteps(loaded.steps);
   },[user?.id,todayKey]);
 
-  const stopSportSensor=useCallback(()=>{
-    if(motionHandlerRef.current){
-      window.removeEventListener("devicemotion",motionHandlerRef.current);
-      motionHandlerRef.current=null;
-    }
-    setSportTracking(false);
-  },[]);
-
-  const startSportSensor=useCallback(async()=>{
-    if(!user?.id){toast("Sign in to track sport data.","❌");return;}
-    if(typeof window==="undefined"||typeof window.addEventListener!=="function"||typeof DeviceMotionEvent==="undefined"){
-      setSportSensorReady(false);
-      toast("Motion sensor not available on this phone/browser.","⚠️");
-      return;
-    }
-    try{
-      if(typeof DeviceMotionEvent.requestPermission==="function"){
-        const perm=await DeviceMotionEvent.requestPermission();
-        if(perm!=="granted"){
-          toast("Motion permission denied.","❌");
-          return;
-        }
-      }
-    }catch(e){
-      toast("Could not access motion sensor.","❌");
-      return;
-    }
-
-    if(motionHandlerRef.current)return;
-    const handler=(ev)=>{
-      const a=ev?.accelerationIncludingGravity;
-      if(!a)return;
-      const x=+a.x||0,y=+a.y||0,z=+a.z||0;
-      const mag=Math.sqrt(x*x+y*y+z*z);
-      const now=Date.now();
-      const st=peakStateRef.current;
-      const crossed=mag>12.2&&st.prevMag<=12.2;
-      if(crossed&&now-st.lastStepTs>320){
-        st.lastStepTs=now;
-        stepCountRef.current+=1;
-        if(stepCountRef.current%5===0){
-          const stored=readSportDay(user.id,todayKey);
-          const updatedSteps=Math.max(stored.steps,stepCountRef.current);
-          writeSportDay(user.id,todayKey,updatedSteps);
-          setSportData(readSportDay(user.id,todayKey));
-        }
-      }
-      st.prevMag=mag;
+  useEffect(()=>{
+    if(stepAnimRef.current)cancelAnimationFrame(stepAnimRef.current);
+    const target=Math.max(0,Math.round(+sportData.steps||0));
+    const animate=()=>{
+      setAnimatedSteps(prev=>{
+        if(prev===target)return prev;
+        const diff=target-prev;
+        const step=Math.max(1,Math.ceil(Math.abs(diff)/8));
+        const next=diff>0?Math.min(target,prev+step):Math.max(target,prev-step);
+        if(next!==target)stepAnimRef.current=requestAnimationFrame(animate);
+        return next;
+      });
     };
-    motionHandlerRef.current=handler;
-    window.addEventListener("devicemotion",handler,{passive:true});
-    setSportSensorReady(true);
-    setSportTracking(true);
-    toast("Sport sensor tracking started.","🏃");
-  },[todayKey,toast,user?.id]);
+    stepAnimRef.current=requestAnimationFrame(animate);
+    return()=>{if(stepAnimRef.current)cancelAnimationFrame(stepAnimRef.current);};
+  },[sportData.steps]);
 
-  useEffect(()=>()=>{if(motionHandlerRef.current)window.removeEventListener("devicemotion",motionHandlerRef.current);},[]);
+  useEffect(()=>{
+    if(!user?.id){setSportSensorLoading(false);return;}
+    let active=true;
+    let stopNative=null;
+
+    const applyTotalSteps=(totalSteps)=>{
+      if(!active||!user?.id)return;
+      const todaySteps=resolveTodaySportSteps(user.id,todayKey,totalSteps);
+      setSportData(deriveSportMetrics(todaySteps));
+    };
+
+    (async()=>{
+      setSportSensorLoading(true);
+      setSportSensorReason(null);
+      if(!supportsNativeStepCounter()){
+        if(active){
+          setSportSensorReady(false);
+          setSportSensorReason("platform");
+          setSportSensorLoading(false);
+        }
+        return;
+      }
+      const started=await startNativeStepCounter((total)=>applyTotalSteps(total));
+      if(!active)return;
+      if(!started?.ok){
+        setSportSensorReady(false);
+        setSportSensorReason(started?.reason||"unavailable");
+        setSportSensorLoading(false);
+        if(started?.reason==="permission")toast("Allow Activity Recognition in Settings for live step tracking.","⚠️");
+        return;
+      }
+      stopNative=started.stop;
+      if(Number.isFinite(started.initialTotalSteps))applyTotalSteps(started.initialTotalSteps);
+      setSportSensorReady(true);
+      setSportSensorReason(null);
+      setSportSensorLoading(false);
+    })();
+
+    return()=>{
+      active=false;
+      if(typeof stopNative==="function")stopNative();
+    };
+  },[todayKey,toast,user?.id]);
 
   return <div style={{paddingBottom:110}}>
     <SBar/>
@@ -1374,7 +1552,10 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
           ))}
         </div>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:12}}>
-          <button className="badge" style={{background:T.white,color:T.mid,border:"none",cursor:"pointer",fontFamily:"Nunito"}} onClick={()=>setSheet("dateMenu")}>Today ▾</button>
+          <button className="badge" style={{background:T.white,color:T.mid,border:"none",cursor:"pointer",fontFamily:"Nunito",display:"inline-flex",alignItems:"center",gap:6}} onClick={()=>setSheet("dateMenu")}>
+            {isSelectedDateSyncing&&<span className="aSpin" style={{display:"inline-block",width:12,height:12,border:`2px solid ${T.border}`,borderTop:`2px solid ${T.purple}`,borderRadius:"50%"}}/>}
+            <span>{selectedDateLabel} ▾</span>
+          </button>
           <span style={{fontSize:13,fontWeight:700,color:left>0?T.green:T.red}}>{left>0?`${left} remaining`:`${Math.abs(left)} over`}</span>
         </div>
       </div>
@@ -1419,7 +1600,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
             </div>
           </div>
           <div className="card hover-card" style={{padding:"14px"}} onClick={()=>setTab("analytics")}>
-            <div style={{display:"flex",justifyContent:"space-between"}}><div><p style={{fontSize:11,fontWeight:700,color:T.light,marginBottom:4}}>Today's Calories</p><p style={{fontSize:20,fontWeight:900}}>{eaten} <span style={{fontSize:12,color:T.mid}}>kcal</span></p></div><div style={{color:T.green}}>{Ic.trendUp}</div></div>
+            <div style={{display:"flex",justifyContent:"space-between"}}><div><p style={{fontSize:11,fontWeight:700,color:T.light,marginBottom:4}}>{selectedDateLabel} Calories</p><p style={{fontSize:20,fontWeight:900}}>{eaten} <span style={{fontSize:12,color:T.mid}}>kcal</span></p></div><div style={{color:T.green}}>{Ic.trendUp}</div></div>
             <div style={{display:"flex",alignItems:"center",gap:5,marginTop:8}}><div style={{width:7,height:7,borderRadius:"50%",background:T.green}}/><span style={{fontSize:11,fontWeight:700,color:T.green}}>On track today</span></div>
           </div>
         </div>
@@ -1427,10 +1608,10 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
 
       {/* Meals */}
       <div>
-        <div className="sec-hdr"><p className="sec-title">Today's Meals</p><button className="sec-link" onClick={()=>setTab("scanner")}>+ Add</button></div>
+        <div className="sec-hdr"><p className="sec-title">{selectedDateMealsTitle}</p><button className="sec-link" onClick={()=>setTab("scanner")}>+ Add</button></div>
         {groups.map(g=>g.items.length>0&&<div key={g.n} style={{marginBottom:14}}>
           <p style={{fontSize:11,fontWeight:700,color:T.light,textTransform:"uppercase",letterSpacing:1.1,marginBottom:8}}>{g.emoji} {g.n}</p>
-          {g.items.map(m=><div key={m.id} className="meal-row" style={{marginBottom:8}} onClick={()=>{setMealView(m);setSheet("mealDetail");}}>
+          {g.items.map(m=><div key={m.id} className="meal-row" style={{marginBottom:8}} onClick={()=>{setMealView(m);setMealBase(m);setMealServingGrams(String(Math.max(1,Math.round(Number(m?.serving_g)||100))));setSheet("mealDetail");}}>
             <div style={{width:44,height:44,borderRadius:13,background:T.white,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,boxShadow:`0 2px 8px ${T.shadow}`}}>{m.e}</div>
             <div style={{flex:1}}><p style={{fontSize:14,fontWeight:700}}>{m.name}</p><p style={{fontSize:11,color:T.light,marginTop:2}}>P:{m.p}g · C:{m.c}g · F:{m.f}g</p></div>
             <div style={{textAlign:"right"}}><p style={{fontSize:15,fontWeight:900,color:T.purple}}>{m.cal}</p><p style={{fontSize:10,color:T.light}}>kcal</p></div>
@@ -1460,12 +1641,8 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
 
     {/* SHEETS */}
     {sheet==="sport"&&<Sheet title="🏃 Sport Data" onClose={()=>setSheet(null)}>
-      <div style={{display:"flex",gap:10,marginBottom:12}}>
-        {!sportTracking
-          ?<button className="btn btn-primary" style={{flex:1}} onClick={startSportSensor}>Start Sensor Tracking</button>
-          :<button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.border}`}} onClick={stopSportSensor}>Stop Sensor Tracking</button>}
-      </div>
-      {!sportSensorReady&&<p style={{fontSize:12,color:T.red,fontWeight:700,marginBottom:12}}>Motion sensor unavailable. You can still log meals/water and view other stats.</p>}
+      {sportSensorLoading&&<div style={{textAlign:"center",padding:"10px 0 16px"}}><div className="aSpin" style={{width:28,height:28,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 10px"}}/><p style={{fontSize:12,color:T.mid,fontWeight:700}}>Connecting step sensor…</p></div>}
+      {!sportSensorLoading&&!sportSensorReady&&<p style={{fontSize:12,color:T.red,fontWeight:700,marginBottom:12}}>{sportSensorReason==="permission"?"Activity Recognition is denied. Enable it in phone Settings → Apps → NutriScan → Permissions.":sportSensorReason==="platform"?"Step tracking is available on Android native app only.":"Step counter sensor unavailable. Reopen the app after enabling permissions."}</p>}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
         {SPORT.map(s=><div key={s.name} className="pcard" style={{background:s.color+"33",padding:"16px"}}><p style={{fontSize:22}}>{s.icon}</p><p style={{fontSize:22,fontWeight:900,marginTop:8}}>{s.fmt(s.val)}<span style={{fontSize:12,color:T.mid,fontWeight:600}}> /{s.max}</span></p><p style={{fontSize:12,color:T.mid,fontWeight:600,marginTop:2}}>{s.name}</p><div className="mbar" style={{marginTop:10}}><div className="mbar-f" style={{width:`${Math.min(100,(s.val/s.max)*100)}%`,background:s.color}}/></div></div>)}
       </div>
@@ -1492,7 +1669,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       </div>
       {/* Drops + progress */}
       <div className="card" style={{marginBottom:12,padding:14}}>
-        <p style={{fontSize:13,fontWeight:800,marginBottom:10}}>Today's Intake</p>
+        <p style={{fontSize:13,fontWeight:800,marginBottom:10}}>{selectedDateIntakeTitle}</p>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",justifyContent:"center",marginBottom:10}}>
           {Array.from({length:8},(_,i)=>(
             <div key={i} className={`wdrop ${i<water?"on":"off"}`} style={{width:32,height:32}} onClick={()=>{const nw=i<water?i:i+1;setWater(nw);if(nw===8)toast("💧 Hydration goal reached!","🏆");}}>
@@ -1518,7 +1695,7 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
         <div style={{display:"flex",justifyContent:"center",gap:20,marginTop:16}}>{[{l:"Deep",v:"2.1h",c:T.purple},{l:"Light",v:"3.8h",c:T.lav},{l:"REM",v:"2.0h",c:T.mint}].map(s=><div key={s.l} style={{textAlign:"center"}}><div style={{width:10,height:10,borderRadius:"50%",background:s.c,margin:"0 auto 6px"}}/><p style={{fontSize:16,fontWeight:800,color:s.c}}>{s.v}</p><p style={{fontSize:11,color:T.light}}>{s.l}</p></div>)}</div>
       </div>
       <div className="card" style={{marginBottom:14}}><p style={{fontSize:14,fontWeight:800,marginBottom:14}}>Sleep This Week</p><ResponsiveContainer width="100%" height={140}><BarChart data={SLEEP} margin={{top:5,right:5,bottom:0,left:-24}}><CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="d" tick={{fill:T.light,fontSize:11,fontFamily:"Nunito",fontWeight:600}}/><YAxis tick={{fill:T.light,fontSize:10,fontFamily:"Nunito"}} domain={[5,10]}/><Tooltip contentStyle={{background:T.white,border:`1px solid ${T.border}`,borderRadius:12,fontFamily:"Nunito"}} formatter={v=>[`${v}h`]}/><Bar dataKey="h" fill={T.lav} radius={[6,6,0,0]}/></BarChart></ResponsiveContainer></div>
-      <button className="btn btn-primary" onClick={()=>{toast("Sleep reminder set for 10:30 PM","🌙");setSheet(null);}}>Set Sleep Reminder</button>
+      <button className="btn btn-primary" onClick={()=>{setSheet(null);setTab("settings");toast("Set your sleep reminder time in Settings → Notifications","🌙");}}>Set Sleep Reminder</button>
     </Sheet>}
 
     {sheet==="bmi"&&<Sheet title="⚖️ BMI & Body" onClose={()=>{setSheet(null);setWeightLogVal("");}}>
@@ -1538,13 +1715,19 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       <input className="inp" type="number" step="0.1" placeholder={`e.g. ${user.weight}`} value={weightLogVal} onChange={e=>setWeightLogVal(e.target.value)} style={{marginBottom:12}}/>
       <button className="btn btn-primary" disabled={weightSaving||!user?.token} onClick={async()=>{
         const w=parseFloat(weightLogVal);
-        if(!isFinite(w)||w<=0||w>400){toast("Enter a valid weight (kg)","❌");return;}
+        const wRounded=Math.round(w*10)/10;
+        if(!isFinite(wRounded)||wRounded<=0||wRounded>250){toast("Enter a valid weight (kg)","❌");return;}
+        const currentW=parseFloat(user.weight);
+        if(isFinite(currentW)&&Math.abs(wRounded-currentW)>15){
+          const proceed=typeof window!=="undefined"?window.confirm(`This is a ${Math.abs(wRounded-currentW).toFixed(1)}kg change. Save anyway?`):true;
+          if(!proceed)return;
+        }
         setWeightSaving(true);
         const today=ymdLocal(new Date());
         try{
-          await supa.upsert(user.token,"weight_logs",{user_id:user.id,weight:w,logged_at:today});
-          await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{weight:w});
-          setUser(u=>({...u,weight:String(w)}));
+          await supa.upsert(user.token,"weight_logs",{user_id:user.id,weight:wRounded,logged_at:today});
+          await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{weight:wRounded});
+          setUser(u=>({...u,weight:String(wRounded)}));
           toast("Weight saved!","⚖️");
           setWeightLogVal("");
           setSheet(null);
@@ -1553,14 +1736,27 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
       }}>{weightSaving?"Saving…":"+ Log Today&apos;s Weight"}</button>
     </Sheet>}
 
-    {sheet==="mealDetail"&&mealView&&<Sheet title={mealView.name} onClose={()=>{setSheet(null);setMealView(null);}}>
-      <div style={{textAlign:"center",marginBottom:20}}><div style={{fontSize:60,marginBottom:8}}>{mealView.e}</div><p style={{fontSize:32,fontWeight:900,color:T.purple}}>{mealView.cal} kcal</p><p style={{fontSize:13,color:T.light,marginTop:4}}>{mealView.m} · {mealView.t}</p></div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:20}}>
-        {[{l:"Protein",v:mealView.p,c:T.blue,bg:T.lavBg},{l:"Carbs",v:mealView.c,c:T.green,bg:T.mintBg},{l:"Fat",v:mealView.f,c:"#F0A060",bg:T.peachBg}].map(m=><div key={m.l} style={{textAlign:"center",padding:14,borderRadius:14,background:m.bg}}><p style={{fontSize:20,fontWeight:900,color:m.c}}>{m.v}g</p><p style={{fontSize:11,fontWeight:600,color:T.light}}>{m.l}</p></div>)}
+    {sheet==="mealDetail"&&mealView&&<Sheet title={mealView.name} onClose={()=>{setSheet(null);setMealView(null);setMealBase(null);setMealServingGrams("100");}}>
+      <div style={{textAlign:"center",marginBottom:20}}><div style={{fontSize:60,marginBottom:8}}>{mealView.e}</div><p style={{fontSize:32,fontWeight:900,color:T.purple}}>{mealDetailPreview?.cal||mealView.cal} kcal</p><p style={{fontSize:13,color:T.light,marginTop:4}}>{mealView.m} · {mealView.t}</p></div>
+      <div style={{marginBottom:14}}>
+        <p style={{fontSize:12,fontWeight:700,color:T.mid,marginBottom:6}}>Serving Size (g)</p>
+        <input className="inp" type="number" min="1" max="2000" value={mealServingGrams} onChange={e=>setMealServingGrams(e.target.value)} />
+        <p style={{fontSize:11,color:T.light,fontWeight:600,marginTop:6}}>Nutrition is scaled from your saved meal amount.</p>
       </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:20}}>
+        {[{l:"Protein",v:mealDetailPreview?.p??mealView.p,c:T.blue,bg:T.lavBg},{l:"Carbs",v:mealDetailPreview?.c??mealView.c,c:T.green,bg:T.mintBg},{l:"Fat",v:mealDetailPreview?.f??mealView.f,c:"#F0A060",bg:T.peachBg}].map(m=><div key={m.l} style={{textAlign:"center",padding:14,borderRadius:14,background:m.bg}}><p style={{fontSize:20,fontWeight:900,color:m.c}}>{m.v}g</p><p style={{fontSize:11,fontWeight:600,color:T.light}}>{m.l}</p></div>)}
+      </div>
+      <button className="btn-soft" style={{marginBottom:10}} onClick={()=>{
+        if(!mealDetailPreview)return;
+        setMeals(p=>p.map(m=>m.id===mealView.id?{...m,cal:mealDetailPreview.cal,p:mealDetailPreview.p,c:mealDetailPreview.c,f:mealDetailPreview.f,serving_g:mealDetailPreview.serving_g}:m));
+        setMealView(v=>v?{...v,cal:mealDetailPreview.cal,p:mealDetailPreview.p,c:mealDetailPreview.c,f:mealDetailPreview.f,serving_g:mealDetailPreview.serving_g}:v);
+        setMealBase(v=>v?{...v,cal:mealDetailPreview.cal,p:mealDetailPreview.p,c:mealDetailPreview.c,f:mealDetailPreview.f}:v);
+        setMealServingGrams("100");
+        toast("Serving updated","✅");
+      }}>Save Serving</button>
       <div style={{display:"flex",gap:10}}>
-        <button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.red}`,color:T.red}} onClick={()=>{setMeals(p=>p.filter(m=>m.id!==mealView.id));toast("Meal removed","🗑️");setSheet(null);setMealView(null);}}>🗑️ Remove</button>
-        <button className="btn btn-primary" style={{flex:1}} onClick={()=>{setMeals(p=>[...p,{...mealView,id:Date.now(),t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}]);toast(`${mealView.name} added again!`,"✅");setSheet(null);}}>+ Add Again</button>
+        <button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.red}`,color:T.red}} onClick={()=>{setMeals(p=>p.filter(m=>m.id!==mealView.id));toast("Meal removed","🗑️");setSheet(null);setMealView(null);setMealBase(null);setMealServingGrams("100");}}>🗑️ Remove</button>
+        <button className="btn btn-primary" style={{flex:1}} onClick={()=>{const mealToAdd=mealDetailPreview||mealView;setMeals(p=>[...p,{...mealToAdd,id:Date.now(),t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}]);toast(`${mealView.name} added again!`,"✅");setSheet(null);setMealBase(null);setMealServingGrams("100");}}>+ Add Again</button>
       </div>
     </Sheet>}
 
@@ -1584,7 +1780,10 @@ function Dashboard({user,setUser,meals,setMeals,water,setWater,toast,setTab,show
     </Sheet>}
 
     {sheet==="dateMenu"&&<Sheet title="📅 Select Date" onClose={()=>setSheet(null)}>
-      {["Today","Yesterday","2 days ago","3 days ago","4 days ago"].map((d,i)=><div key={i} onClick={()=>{toast(`Viewing ${d}'s log`,"📅");setSheet(null);}} style={{padding:"14px",borderRadius:14,marginBottom:8,background:i===0?T.lavBg:T.bg,border:`2px solid ${i===0?T.purple:T.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontWeight:i===0?800:600,transition:"all .18s"}}><span>{d}</span>{i===0&&<span style={{color:T.purple}}>✓</span>}</div>)}
+      {selectedDateOptions.map(opt=>{
+        const active=opt.date===selectedDate;
+        return <div key={opt.date} onClick={()=>{onSelectDate&&onSelectDate(opt.date);toast(`Viewing ${opt.label}'s log`,"📅");setSheet(null);}} style={{padding:"14px",borderRadius:14,marginBottom:8,background:active?T.lavBg:T.bg,border:`2px solid ${active?T.purple:T.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontWeight:active?800:600,transition:"all .18s"}}><span>{opt.label}</span>{active&&<span style={{color:T.purple}}>✓</span>}</div>;
+      })}
     </Sheet>}
   </div>;
 }
@@ -1607,11 +1806,20 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   // ── SEARCH state ──
   const [searchQ,setSearchQ]=useState("");
   const [searchResults,setSearchResults]=useState([]);
+  const [searchAllResults,setSearchAllResults]=useState([]); // all loaded results for pagination
+  const [searchSections,setSearchSections]=useState({best:[],local:[],related:[]});
   const [searchLoading,setSearchLoading]=useState(false);
   const [searchDone,setSearchDone]=useState(false);
-  const [filterCal,setFilterCal]=useState("all"); // all|low|mid|high
-  const [filterCat,setFilterCat]=useState("all"); // all|indian|drinks|snacks|dairy|grains
-  const [sortBy,setSortBy]=useState("relevance"); // relevance|cal_asc|cal_desc|protein
+  const [searchOffset,setSearchOffset]=useState(0); // pagination offset
+  const [searchHasMore,setSearchHasMore]=useState(false); // more results available
+  const [searchLastQuery,setSearchLastQuery]=useState(""); // cache for Load More
+  const [searchLastLocale,setSearchLastLocale]=useState(null); // cache for Load More
+  const [searchLoadingMore,setSearchLoadingMore]=useState(false); // separate loading state for Load More
+  const [searchDisplayLimit]=useState(10); // show 10 results per page
+  const [expandedSearchId,setExpandedSearchId]=useState(null);
+  const [searchPortions,setSearchPortions]=useState({});
+  const [searchMeals,setSearchMeals]=useState({});
+  const [searchAddedId,setSearchAddedId]=useState(null);
 
   // ── MANUAL state ──
   const [manual,setManual]=useState({name:"",cal:"",p:"",c:"",f:"",e:"🍽️"});
@@ -1627,109 +1835,306 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const [barcodeInput,setBarcodeInput]=useState("");
   const barcodeStartRef=useRef(0);
   const barcodeOpenTimeoutRef=useRef(null);
+  const barcodeStatusRef=useRef("idle");
+  const nativeBarcodePreviewRef=useRef(false);
+  const nativeBarcodeScanTimerRef=useRef(null);
+  const nativeBarcodeScanBusyRef=useRef(false);
 
   // ── CAMERA/AI state ──
   const [scan,setScan]=useState(false);
-  const [aiLoading,setAiLoading]=useState(false);
+  const [aiScanStatus,setAiScanStatus]=useState("idle"); // "idle" | "loading" | "scanning"
   const videoAiRef=useRef(null);
   const streamAiRef=useRef(null);
   const canvasRef=useRef(null);
-  const [cameraOn,setCameraOn]=useState(false);
+  const aiScanStartRef=useRef(null);
 
   const EMOJIS=["🍽️","🥗","🍛","🍜","🍕","🍔","🥩","🐟","🥚","🧀","🥛","🍞","🥦","🍎","🍌","🍗","🥤","🍣","🍝","🥙"];
+  const barcodeFormats=["ean_13","ean_8","upc_a","upc_e","code_128","code_39","qr_code"];
 
-  // ── Open Food Facts search ──
-  const mapOpenFoodProducts=(products)=>{
-    return (products||[])
-      .filter(p=>p.product_name&&(p.nutriments?.["energy-kcal_100g"]||p.nutriments?.["energy-kcal"]))
-      .map(p=>{
-        const n=p.nutriments||{};
-        const serving=parseFloat(p.serving_size)||100;
-        const f=serving/100;
-        const kcal=Math.round((n["energy-kcal_100g"]||n["energy-kcal"]||0)*f);
-        const cats=(p.categories_tags||[]).join(" ");
-        let cat="other";
-        if(cats.includes("indian")||cats.includes("dals")||cats.includes("curry"))cat="indian";
-        else if(cats.includes("beverage")||cats.includes("drink")||cats.includes("juice"))cat="drinks";
-        else if(cats.includes("snack")||cats.includes("biscuit")||cats.includes("chip"))cat="snacks";
-        else if(cats.includes("dairy")||cats.includes("milk")||cats.includes("cheese")||cats.includes("yogurt"))cat="dairy";
-        else if(cats.includes("bread")||cats.includes("grain")||cats.includes("rice")||cats.includes("wheat"))cat="grains";
-        return{
-          id:p.code||Math.random(),
-          name:p.product_name||(p.brands?" by "+p.brands:""),
-          brand:p.brands||"",
-          cal:kcal,
-          p:Math.round((n.proteins_100g||0)*f*10)/10,
-          c:Math.round((n.carbohydrates_100g||0)*f*10)/10,
-          f:Math.round((n.fat_100g||0)*f*10)/10,
-          serving:p.serving_size||"100g",
-          score:p.nutriscore_grade||"",
-          img:p.image_front_small_url||"",
-          cat,emoji:"🍽️",
-        };
-      })
-      .filter(p=>p.cal>0);
+  useEffect(()=>{barcodeStatusRef.current=barcodeStatus;},[barcodeStatus]);
+
+  const readNativeCaptureDataUrl=(captureResult)=>{
+    const raw=String(captureResult?.value||captureResult?.base64String||captureResult?.data||"");
+    if(!raw)return"";
+    if(/^data:image\//i.test(raw))return raw;
+    return `data:image/jpeg;base64,${raw}`;
+  };
+
+  const detectBarcodeFromDataUrl=async(dataUrl,detector)=>{
+    if(!dataUrl||!detector)return null;
+    return await new Promise(resolve=>{
+      const img=new Image();
+      img.onload=async()=>{
+        try{
+          const codes=await detector.detect(img);
+          resolve(codes?.length?String(codes[0].rawValue||""):null);
+        }catch(e){resolve(null);}
+      };
+      img.onerror=()=>resolve(null);
+      img.src=dataUrl;
+    });
+  };
+
+  const waitForBarcodePreviewHost=async(maxTries=30)=>{
+    for(let i=0;i<maxTries;i++){
+      const host=document.getElementById("barcode-preview-host");
+      if(host)return host;
+      await new Promise(r=>setTimeout(r,50));
+    }
+    return null;
+  };
+
+  const stopNativeBarcodePreview=async()=>{
+    if(nativeBarcodeScanTimerRef.current){clearInterval(nativeBarcodeScanTimerRef.current);nativeBarcodeScanTimerRef.current=null;}
+    nativeBarcodeScanBusyRef.current=false;
+    if(nativeBarcodePreviewRef.current){
+      nativeBarcodePreviewRef.current=false;
+      try{await CameraPreview.stop();}catch(e){}
+    }
+  };
+
+  // ── Supabase food search (location-aware sectioned) ──
+  const resolveSearchLocale=()=>{
+    const userCountryRaw=String(user?.country||"").trim().toLowerCase();
+    const userStateRaw=String(user?.state||"").trim().toLowerCase();
+    let country=userCountryRaw;
+    if(country==="in")country="india";
+    if(!country){
+      try{
+        const tz=Intl.DateTimeFormat().resolvedOptions().timeZone||"";
+        if(/kolkata/i.test(tz))country="india";
+      }catch(e){}
+    }
+    return {country,state:userStateRaw};
+  };
+
+  const resolveLocalPriority=({country,state})=>{
+    if(state==="manipur")return 1;
+    if(country==="india")return 2;
+    if(country)return 3;
+    return 2;
+  };
+
+  const bucketSearchSections=(rows)=>{
+    const locale=resolveSearchLocale();
+    const localPriority=resolveLocalPriority(locale);
+    const best=[];
+    const local=[];
+    const related=[];
+    const bestIds=new Set();
+
+    (rows||[]).forEach(item=>{
+      if(item.matchType==="related")related.push(item);
+      else if(best.length<6){best.push(item);bestIds.add(item.id);}
+    });
+
+    (rows||[]).forEach(item=>{
+      if(item.matchType==="related")return;
+      if(item.priority===localPriority&&!bestIds.has(item.id)&&local.length<4){
+        local.push(item);
+      }
+    });
+
+    return {best,local,related};
+  };
+
+  const mapFoodRows=(rows)=>{
+    return (rows||[]).map(r=>({
+      id:r.id,
+      name:r.name,
+      category:r.category||"",
+      country:r.country||"",
+      priority:+r.priority||2,
+      matchType:r.match_type||"name",
+      cal:Math.round(+r.calories||0),
+      p:Math.round((+r.protein||0)*10)/10,
+      c:0,
+      f:0,
+      emoji:"🍽️",
+      source:"search",
+    }));
+  };
+
+  const readLocalSearchCache=(cacheKey)=>{
+    try{
+      const raw=localStorage.getItem(FOOD_SEARCH_CACHE_KEY);
+      if(!raw)return null;
+      const store=JSON.parse(raw);
+      const entry=store?.[cacheKey];
+      if(!entry||!Array.isArray(entry.rows)||!entry.ts)return null;
+      if(Date.now()-entry.ts>FOOD_SEARCH_CACHE_TTL_MS)return null;
+      return entry.rows;
+    }catch(e){
+      return null;
+    }
+  };
+
+  const writeLocalSearchCache=(cacheKey,rows)=>{
+    try{
+      const raw=localStorage.getItem(FOOD_SEARCH_CACHE_KEY);
+      const store=raw?JSON.parse(raw):{};
+      store[cacheKey]={ts:Date.now(),rows};
+      const keys=Object.keys(store);
+      if(keys.length>40){
+        keys.sort((a,b)=>(store[b]?.ts||0)-(store[a]?.ts||0));
+        const trimmed={};
+        keys.slice(0,40).forEach(k=>{trimmed[k]=store[k];});
+        localStorage.setItem(FOOD_SEARCH_CACHE_KEY,JSON.stringify(trimmed));
+        return;
+      }
+      localStorage.setItem(FOOD_SEARCH_CACHE_KEY,JSON.stringify(store));
+    }catch(e){}
   };
 
   const searchFood=async(q)=>{
-    if(!q.trim()){setSearchResults([]);setSearchDone(false);setSearchLoading(false);return;}
-    if(!user?.token){setSearchLoading(false);toast("Sign in to search foods.","❌");return;}
-    const cacheKey=q.trim().toLowerCase();
+    const normalized=String(q||"")
+      .trim()
+      .toLowerCase()
+      .replace(/\bdal\s+chawal\b/g,"dal rice")
+      .replace(/\blentils?\s+rice\b/g,"dal rice")
+      .replace(/\s+/g," ");
+    if(!normalized){
+      setSearchResults([]);
+      setSearchAllResults([]);
+      setSearchSections({best:[],local:[],related:[]});
+      setSearchDone(false);
+      setSearchLoading(false);
+      setSearchOffset(0);
+      setSearchHasMore(false);
+      setExpandedSearchId(null);
+      return;
+    }
+
+    const locale=resolveSearchLocale();
+    const cacheKey=`${normalized}|${locale.country||""}|${locale.state||""}`;
+    
+    // Cache check
     if(FOOD_SEARCH_CACHE.has(cacheKey)){
-      setSearchResults(FOOD_SEARCH_CACHE.get(cacheKey));
+      const allRows=FOOD_SEARCH_CACHE.get(cacheKey);
+      setSearchLastQuery(normalized);
+      setSearchLastLocale(locale);
+      setSearchOffset(searchDisplayLimit);
+      const displayed=allRows.slice(0,searchDisplayLimit);
+      setSearchAllResults(displayed);
+      setSearchResults(displayed);
+      setSearchSections(bucketSearchSections(displayed));
+      setSearchHasMore(allRows.length>=searchDisplayLimit);
       setSearchDone(true);
       setSearchLoading(false);
       return;
     }
+
+    const localRows=readLocalSearchCache(cacheKey);
+    if(localRows){
+      FOOD_SEARCH_CACHE.set(cacheKey,localRows);
+      setSearchLastQuery(normalized);
+      setSearchLastLocale(locale);
+      setSearchOffset(searchDisplayLimit);
+      const displayed=localRows.slice(0,searchDisplayLimit);
+      setSearchAllResults(displayed);
+      setSearchResults(displayed);
+      setSearchSections(bucketSearchSections(displayed));
+      setSearchHasMore(localRows.length>=searchDisplayLimit);
+      setSearchDone(true);
+      setSearchLoading(false);
+      return;
+    }
+
     setSearchLoading(true);setSearchDone(false);setRes(null);
     try{
-      const data=await supa.openFood(user.token,{action:"search",q:q.trim()});
-      const products=mapOpenFoodProducts(data.products);
-      FOOD_SEARCH_CACHE.set(cacheKey,products);
-      setSearchResults(products);
+      const rows=await supa.rpc(user?.token,"search_foods_paginated",{
+        p_query:normalized,
+        p_limit:searchDisplayLimit,
+        p_offset:0,
+        p_user_country:locale.country||null,
+        p_user_state:locale.state||null,
+      });
+      const mapped=mapFoodRows(rows);
+      FOOD_SEARCH_CACHE.set(cacheKey,mapped);
+      writeLocalSearchCache(cacheKey,mapped);
+      setSearchAllResults(mapped);
+      setSearchLastQuery(normalized);
+      setSearchLastLocale(locale);
+      setSearchOffset(mapped.length);
+      setSearchResults(mapped);
+      setSearchSections(bucketSearchSections(mapped));
+      setSearchHasMore(mapped.length>=searchDisplayLimit);
       setSearchDone(true);
     }catch(e){
+      console.error("RPC search_foods_paginated failed, falling back to search_foods:",e);
       try{
-        const r=await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q.trim())}&search_simple=1&action=process&json=1&page_size=25`);
-        const j=await r.json();
-        const products=mapOpenFoodProducts(j.products);
-        FOOD_SEARCH_CACHE.set(cacheKey,products);
-        setSearchResults(products);
+        const rows=await supa.rpc(user?.token,"search_foods",{
+          p_query:normalized,
+          p_limit:searchDisplayLimit,
+          p_user_country:locale.country||null,
+          p_user_state:locale.state||null,
+        });
+        const mapped=mapFoodRows(rows);
+        FOOD_SEARCH_CACHE.set(cacheKey,mapped);
+        writeLocalSearchCache(cacheKey,mapped);
+        setSearchAllResults(mapped);
+        setSearchLastQuery(normalized);
+        setSearchLastLocale(locale);
+        setSearchOffset(mapped.length);
+        setSearchResults(mapped);
+        setSearchSections(bucketSearchSections(mapped));
+        setSearchHasMore(mapped.length>=searchDisplayLimit);
         setSearchDone(true);
-        toast("Using public food database fallback.","ℹ️");
-      }catch(_){
+      }catch(e2){
         toast("Search failed. Check connection.","❌");
       }
     }
     setSearchLoading(false);
   };
 
-  // Debounced search
+  // Load more search results
+  const loadMoreSearchResults=async()=>{
+    if(searchLoadingMore||!searchHasMore||!searchLastQuery)return;
+    
+    setSearchLoadingMore(true);
+    try{
+      const newOffset=searchOffset;
+      const rows=await supa.rpc(user?.token,"search_foods_paginated",{
+        p_query:searchLastQuery,
+        p_limit:searchDisplayLimit,
+        p_offset:newOffset,
+        p_user_country:searchLastLocale?.country||null,
+        p_user_state:searchLastLocale?.state||null,
+      });
+      
+      const mapped=mapFoodRows(rows);
+      const updated=[...searchAllResults,...mapped];
+      setSearchAllResults(updated);
+      setSearchOffset(newOffset+mapped.length);
+      setSearchResults(updated);
+      setSearchSections(bucketSearchSections(updated));
+      setSearchHasMore(mapped.length>=searchDisplayLimit);
+    }catch(e){
+      console.error("Load more failed:",e);
+      toast("Couldn't load more foods right now.","⚠️");
+    }
+    setSearchLoadingMore(false);
+  };
+
+  // Debounced search (400ms)
   const searchTimer=useRef(null);
   const onSearchChange=v=>{
     setSearchQ(v);
     clearTimeout(searchTimer.current);
-    if(v.length>2){
+    if(v.trim().length>1){
       setSearchLoading(true);
-      searchTimer.current=setTimeout(()=>searchFood(v),600);
-    }else{setSearchResults([]);setSearchDone(false);setSearchLoading(false);}
+      searchTimer.current=setTimeout(()=>searchFood(v),400);
+    }else{
+      setSearchResults([]);
+      setSearchAllResults([]);
+      setSearchSections({best:[],local:[],related:[]});
+      setSearchDone(false);
+      setSearchLoading(false);
+      setSearchOffset(0);
+      setSearchHasMore(false);
+      setExpandedSearchId(null);
+    }
   };
-
-  // Apply filters + sort
-  const filteredResults=searchResults
-    .filter(p=>{
-      if(filterCal==="low"&&p.cal>150)return false;
-      if(filterCal==="mid"&&(p.cal<=150||p.cal>400))return false;
-      if(filterCal==="high"&&p.cal<=400)return false;
-      if(filterCat!=="all"&&p.cat!==filterCat)return false;
-      return true;
-    })
-    .sort((a,b)=>{
-      if(sortBy==="cal_asc")return a.cal-b.cal;
-      if(sortBy==="cal_desc")return b.cal-a.cal;
-      if(sortBy==="protein")return b.p-a.p;
-      return 0;
-    });
 
   // ── Barcode lookup ──
   const openRearCameraStream=async()=>{
@@ -1749,51 +2154,58 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   };
 
   const lookupBarcode=async(code)=>{
-    if(!user?.token){toast("Sign in to look up barcodes.","❌");return;}
+    const normalizedCode=String(code||"").replace(/[^\da-z]/gi,"").trim();
+    if(!normalizedCode||normalizedCode.length<8){toast("Enter a valid barcode.","❌");return;}
+    if(barcodeLoading)return;
     setBarcodeLoading(true);setRes(null);
+    const setProductResult=(p)=>{
+      const n=p?.nutriments||{};
+      const serving=parseFloat(p?.serving_size)||100;
+      const f=serving/100;
+      setRes({name:p?.product_name||"Unknown Product",emoji:"📦",
+        cal:Math.round((n["energy-kcal_100g"]||n["energy-kcal"]||0)*f),
+        p:Math.round((n.proteins_100g||0)*f*10)/10,
+        c:Math.round((n.carbohydrates_100g||0)*f*10)/10,
+        f:Math.round((n.fat_100g||0)*f*10)/10,
+        conf:100,source:"barcode",
+        items:[`${p?.product_name||""}`,`Serving: ${p?.serving_size||"100g"}`,p?.brands?`Brand: ${p.brands}`:""].filter(Boolean),
+      });
+      setBarcodeStatus("found");
+    };
+
     try{
-      const data=await supa.openFood(user.token,{action:"product",code:String(code).trim()});
-      if(data.status===1&&data.product){
-        const p=data.product;const n=p.nutriments||{};
-        const serving=parseFloat(p.serving_size)||100;const f=serving/100;
-        setRes({name:p.product_name||"Unknown Product",emoji:"📦",
-          cal:Math.round((n["energy-kcal_100g"]||n["energy-kcal"]||0)*f),
-          p:Math.round((n.proteins_100g||0)*f*10)/10,
-          c:Math.round((n.carbohydrates_100g||0)*f*10)/10,
-          f:Math.round((n.fat_100g||0)*f*10)/10,
-          conf:100,source:"barcode",
-          items:[`${p.product_name}`,`Serving: ${p.serving_size||"100g"}`,p.brands?`Brand: ${p.brands}`:""].filter(Boolean),
-        });
-        playSfx&&playSfx("scan");
-        setBarcodeStatus("found");
-      }else{toast("Product not found. Try searching by name.","❌");setBarcodeStatus("idle");}
-    }catch(e){
-      try{
-        const r=await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(String(code).trim())}.json`);
-        const data=await r.json();
-        if(data.status===1&&data.product){
-          const p=data.product;const n=p.nutriments||{};
-          const serving=parseFloat(p.serving_size)||100;const f=serving/100;
-          setRes({name:p.product_name||"Unknown Product",emoji:"📦",
-            cal:Math.round((n["energy-kcal_100g"]||n["energy-kcal"]||0)*f),
-            p:Math.round((n.proteins_100g||0)*f*10)/10,
-            c:Math.round((n.carbohydrates_100g||0)*f*10)/10,
-            f:Math.round((n.fat_100g||0)*f*10)/10,
-            conf:100,source:"barcode",
-            items:[`${p.product_name}`,`Serving: ${p.serving_size||"100g"}`,p.brands?`Brand: ${p.brands}`:""].filter(Boolean),
-          });
-          playSfx&&playSfx("scan");
-          setBarcodeStatus("found");
-        }else{
-          toast("Product not found. Try searching by name.","❌");
-          setBarcodeStatus("idle");
-        }
-      }catch(_){
-        toast("Network error.","❌");
+      if(user?.token){
+        try{
+          const data=await supa.openFood(user.token,{action:"product",code:normalizedCode});
+          if(data?.status===1&&data?.product){
+            setProductResult(data.product);
+            setBarcodeLoading(false);
+            return;
+          }
+        }catch(_){/* fall through to public API */}
+      }
+
+      const r=await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(normalizedCode)}.json`);
+      const data=await r.json();
+      if(data?.status===1&&data?.product){
+        setProductResult(data.product);
+      }else{
+        toast("Product not found. Try searching by name.","❌");
         setBarcodeStatus("idle");
       }
+    }catch(_){
+      toast("Network error.","❌");
+      setBarcodeStatus("idle");
     }
     setBarcodeLoading(false);
+  };
+
+  const submitManualBarcode=()=>{
+    const code=String(barcodeInput||"").replace(/\s+/g,"").trim();
+    if(!code){toast("Enter a barcode first.","❌");return;}
+    stopBarcodeCam();
+    setBarcodeStatus("idle");
+    lookupBarcode(code);
   };
 
   const requestCameraPermission=async()=>{
@@ -1813,15 +2225,72 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const startBarcodeCam=async()=>{
     const reqId=++barcodeStartRef.current;
     if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
-    setCamErr("");setBarcodeStatus("opening");setRes(null);
+    setCamErr("");setBarcodeStatus("loading");setRes(null);
     barcodeOpenTimeoutRef.current=setTimeout(()=>{
       setBarcodeStatus(s=>{
-        if(s!=="opening")return s;
+        if(s!=="loading")return s;
         setCamErr("Camera took too long to open. Enter barcode manually.");
         return "manual-barcode";
       });
     },8000);
     try{
+      if(isNativeApp()){
+        const perm=await requestCameraPermission();
+        if(!perm){
+          if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
+          setBarcodeStatus("idle");
+          return;
+        }
+        const host=await waitForBarcodePreviewHost();
+        if(!host)throw new Error("Preview container not ready");
+        const rect=host.getBoundingClientRect();
+        try{await CameraPreview.stop();}catch(e){}
+        await CameraPreview.start({
+          parent:"barcode-preview-host",
+          className:"barcode-native-preview",
+          position:"rear",
+          x:Math.max(0,Math.round(rect.left)),
+          y:Math.max(0,Math.round(rect.top)),
+          width:Math.max(1,Math.round(rect.width)),
+          height:Math.max(1,Math.round(rect.height)),
+          toBack:false,
+          enableZoom:true,
+          disableAudio:true,
+          storeToFile:false,
+        });
+        nativeBarcodePreviewRef.current=true;
+        if(reqId!==barcodeStartRef.current){await stopNativeBarcodePreview();return;}
+        if(barcodeOpenTimeoutRef.current){clearTimeout(barcodeOpenTimeoutRef.current);barcodeOpenTimeoutRef.current=null;}
+        setBarcodeStatus("scanning");
+
+        if(!("BarcodeDetector" in window)){
+          setCamErr("Auto-scan not supported on this device. Enter barcode manually.");
+          await stopNativeBarcodePreview();
+          setBarcodeStatus("manual-barcode");
+          return;
+        }
+        const detector=new window.BarcodeDetector({formats:barcodeFormats});
+        nativeBarcodeScanTimerRef.current=setInterval(async()=>{
+          if(nativeBarcodeScanBusyRef.current)return;
+          if(barcodeStatusRef.current!=="scanning")return;
+          nativeBarcodeScanBusyRef.current=true;
+          try{
+            const frame=await CameraPreview.capture({quality:40});
+            const dataUrl=readNativeCaptureDataUrl(frame);
+            const code=await detectBarcodeFromDataUrl(dataUrl,detector);
+            if(code){
+              clearInterval(nativeBarcodeScanTimerRef.current);
+              nativeBarcodeScanTimerRef.current=null;
+              await stopNativeBarcodePreview();
+              await lookupBarcode(code);
+            }
+          }catch(e){}
+          nativeBarcodeScanBusyRef.current=false;
+        },650);
+        setTimeout(()=>{setBarcodeStatus(s=>{if(s==="scanning"){stopNativeBarcodePreview();return"manual-barcode";}return s;});},25000);
+        return;
+      }
+
       // Use web-based barcode detection (native ML Kit barcode scanner disabled due to Android compilation issues)
       if(true){ // Temporarily disable native, use web fallback always
         // Fallback to web-based barcode detection
@@ -1871,28 +2340,36 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
     clearInterval(intervalRef.current);
     if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}
     if(videoRef.current)videoRef.current.srcObject=null;
+    stopNativeBarcodePreview();
   };
 
   // ── AI Camera scan ──
   const startAiCamera=async()=>{
+    if(aiScanStartRef.current)return; // Prevent double-start
+    aiScanStartRef.current=true;
+    setAiScanStatus("loading");
     try{
       const perm=await requestCameraPermission();
-      if(!perm)return;
+      if(!perm){aiScanStartRef.current=null;setAiScanStatus("idle");return;}
       const stream=await openRearCameraStream();
       streamAiRef.current=stream;
       if(videoAiRef.current){videoAiRef.current.srcObject=stream;videoAiRef.current.play();}
-      setCameraOn(true);
+      setAiScanStatus("scanning");
+      aiScanStartRef.current=null;
     }catch(e){
       logAppError(e,"scanner.ai_camera_open");
       try{
         const fallback=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:960,max:1280},height:{ideal:540,max:720},frameRate:{ideal:20,max:24}}});
         streamAiRef.current=fallback;
         if(videoAiRef.current){videoAiRef.current.srcObject=fallback;videoAiRef.current.play();}
-        setCameraOn(true);
+        setAiScanStatus("scanning");
         toast("Camera opened (check your settings if quality is low)","ℹ️");
+        aiScanStartRef.current=null;
       }catch(_){
         logAppError(_,"scanner.ai_camera_fallback_open");
         toast("Camera access denied. Please enable camera permissions in app settings.","❌");
+        setAiScanStatus("idle");
+        aiScanStartRef.current=null;
       }
     }
   };
@@ -1900,13 +2377,14 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   const stopAiCamera=()=>{
     if(streamAiRef.current){streamAiRef.current.getTracks().forEach(t=>t.stop());streamAiRef.current=null;}
     if(videoAiRef.current)videoAiRef.current.srcObject=null;
-    setCameraOn(false);setScan(false);
+    setAiScanStatus("idle");setScan(false);
+    aiScanStartRef.current=null;
   };
 
   const doAiScan=async()=>{
     if(!videoAiRef.current||!canvasRef.current)return;
     if(!user?.token){toast("Sign in to use AI scan.","❌");return;}
-    setScan(true);setAiLoading(true);setRes(null);
+    setScan(true);setAiScanStatus("scanning");setRes(null);
     try{
       const canvas=canvasRef.current;
       canvas.width=videoAiRef.current.videoWidth||640;
@@ -1921,7 +2399,6 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
       if(match){
         const parsed=JSON.parse(match[0]);
         setRes({...parsed,conf:88,source:"ai"});
-        playSfx&&playSfx("scan");
       }else{
         // Fallback: parse text response
         toast("AI couldn't identify this image. Try clearer lighting or manual entry.","❌");
@@ -1930,7 +2407,7 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
       logAppError(e,"scanner.ai_scan");
       toast(e?.message||"AI scan failed. Try again.","❌");
     }
-    setScan(false);setAiLoading(false);
+    setScan(false);
   };
 
   // Cleanup on tab change
@@ -1942,6 +2419,12 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
     if(mode!=="camera"){stopAiCamera();}
     setRes(null);
   },[mode]);
+
+  useEffect(()=>{
+    if(mode==="barcode"&&online&&barcodeStatus==="idle"&&!res){
+      startBarcodeCam();
+    }
+  },[barcodeStatus,mode,online,res]);
 
   const addLog=(food)=>{
     const f=food||res;if(!f)return;
@@ -1956,6 +2439,114 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
     if(!manual.cal||isNaN(+manual.cal)||+manual.cal<=0){setManualErr("Enter valid calories");return;}
     setManualErr("");
     setRes({name:manual.name.trim(),emoji:manual.e,cal:+manual.cal,p:+(manual.p)||0,c:+(manual.c)||0,f:+(manual.f)||0,conf:100,source:"manual",items:[manual.name.trim()]});
+  };
+
+  const getSearchPortion=(foodId)=>Math.max(0.25,Math.min(3,Number(searchPortions?.[foodId]||1)));
+  const getSearchMealType=(foodId)=>searchMeals?.[foodId]||mealType||"Lunch";
+
+  const addSearchFood=(food)=>{
+    if(!food)return;
+    const portion=getSearchPortion(food.id);
+    const targetMeal=getSearchMealType(food.id);
+    onAddMeal({
+      ...food,
+      cal:Math.round((food.cal||0)*portion),
+      p:Math.round(((food.p||0)*portion)*10)/10,
+      c:Math.round(((food.c||0)*portion)*10)/10,
+      f:Math.round(((food.f||0)*portion)*10)/10,
+      m:targetMeal,
+      t:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      id:Date.now(),
+      e:food.emoji||"🍽️"
+    });
+    playSfx&&playSfx("success");
+    toast(`${food.name} added to ${targetMeal}!`,"✅");
+    setSearchAddedId(food.id);
+    setTimeout(()=>setSearchAddedId(null),280);
+  };
+
+  const SearchFoodRow=({food,icon="🍽️",chipBg=T.lavBg})=>{
+    const expanded=expandedSearchId===food.id;
+    const justAdded=searchAddedId===food.id;
+    const portion=getSearchPortion(food.id);
+    const selectedMeal=getSearchMealType(food.id);
+    const kcal=Math.round((food.cal||0)*portion);
+    const protein=Math.round(((food.p||0)*portion)*10)/10;
+
+    return <div className="hover-card" style={{background:T.white,borderRadius:16,padding:"12px 14px",boxShadow:`0 2px 10px ${T.shadow}`,border:`2px solid ${expanded?T.purple:"transparent"}`}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <div style={{width:44,height:44,borderRadius:12,background:chipBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>{icon}</div>
+        <div style={{flex:1,minWidth:0}}>
+          <p style={{fontWeight:700,fontSize:13,lineHeight:1.3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{food.name}</p>
+          <p style={{fontSize:11,color:T.light,marginTop:2}}>{food.category} · {food.country}</p>
+          <div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
+            <span style={{fontSize:11,fontWeight:700,color:T.purple}}>{kcal} kcal</span>
+            <span style={{fontSize:11,color:T.light}}>Protein: {protein}g</span>
+          </div>
+        </div>
+        <button
+          onClick={()=>{
+            if(expanded){setExpandedSearchId(null);return;}
+            setExpandedSearchId(food.id);
+            setSearchPortions(prev=>prev?.[food.id]?prev:{...prev,[food.id]:1});
+            setSearchMeals(prev=>prev?.[food.id]?prev:{...prev,[food.id]:mealType||"Lunch"});
+          }}
+          style={{
+            width:36,
+            height:36,
+            borderRadius:12,
+            border:`2px solid ${expanded?T.purple:T.border}`,
+            background:expanded?T.purple:T.white,
+            color:expanded?T.white:T.purple,
+            fontSize:22,
+            fontWeight:900,
+            lineHeight:1,
+            cursor:"pointer",
+            display:"flex",
+            alignItems:"center",
+            justifyContent:"center",
+            flexShrink:0,
+            transition:"all .2s ease",
+            transform:expanded?"scale(1.04)":"scale(1)"
+          }}
+          aria-label={expanded?"Collapse details":"Expand details"}
+        >{expanded?"−":"+"}</button>
+      </div>
+
+      {expanded&&<div className="aFadeIn" style={{marginTop:12,paddingTop:12,borderTop:`1px solid ${T.border}`,animationDuration:".18s"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+          <p style={{fontSize:12,fontWeight:700,color:T.mid}}>Quantity</p>
+          <p style={{fontSize:12,fontWeight:800,color:T.purple}}>{portion}× serving</p>
+        </div>
+        <input
+          type="range"
+          min="0.25"
+          max="3"
+          step="0.25"
+          value={portion}
+          onChange={e=>setSearchPortions(prev=>({...prev,[food.id]:parseFloat(e.target.value)}))}
+          style={{width:"100%",accentColor:T.purple,marginBottom:10}}
+        />
+        <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
+          {["Breakfast","Lunch","Snack","Dinner"].map(mt=><button key={mt} onClick={()=>setSearchMeals(prev=>({...prev,[food.id]:mt}))} style={{padding:"6px 12px",borderRadius:20,border:`2px solid ${selectedMeal===mt?T.purple:T.border}`,background:selectedMeal===mt?T.lavBg:T.white,color:selectedMeal===mt?T.purple:T.mid,fontFamily:"Nunito",fontWeight:700,fontSize:11,cursor:"pointer"}}>{mt}</button>)}
+        </div>
+        <button
+          className="btn btn-primary"
+          onClick={()=>addSearchFood(food)}
+          style={{
+            padding:"11px 14px",
+            fontSize:13,
+            borderRadius:12,
+            transition:"all .2s ease",
+            transform:justAdded?"scale(1.03)":"scale(1)",
+            boxShadow:justAdded?`0 0 0 4px ${T.mintBg}`:"none",
+            background:justAdded?T.green:undefined
+          }}
+        >
+          {justAdded?"✓ Added":"+ Add "+portion+"× to "+selectedMeal}
+        </button>
+      </div>}
+    </div>;
   };
 
   const ResultCard=({food})=>{
@@ -1990,15 +2581,15 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
   return <div style={{paddingBottom:110}}><SBar/>
     <div style={{padding:"4px 16px 20px",maxWidth:600,margin:"0 auto",width:"100%"}}>
       {!online&&<div className="card" style={{marginBottom:12,background:T.peachBg,padding:12}}><p style={{fontSize:13,fontWeight:700,lineHeight:1.45}}>📡 Offline — only ✏️ Manual works. Entries are saved and sync to Supabase when you&apos;re online.</p></div>}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <div><h2 style={{fontSize:24,fontWeight:900}}>Food Scanner</h2><p style={{fontSize:13,color:T.light,fontWeight:500}}>Search, scan or enter manually</p></div>
-        <div style={{display:"flex",alignItems:"center",gap:6,padding:"6px 12px",borderRadius:20,background:T.mintBg}}><div style={{width:6,height:6,borderRadius:"50%",background:T.green}}/><span style={{fontSize:11,fontWeight:700,color:T.green}}>Live DB</span></div>
+      <div className="scan-hero">
+        <div><h2 style={{fontSize:24,fontWeight:900,letterSpacing:-.2}}>Food Scanner</h2><p style={{fontSize:13,color:T.light,fontWeight:600}}>Search, scan or enter manually</p></div>
+        <div className="scan-live-pill"><div style={{width:6,height:6,borderRadius:"50%",background:T.green,boxShadow:`0 0 10px ${T.green}`}}/><span style={{fontSize:11,fontWeight:800,color:T.green}}>Live DB</span></div>
       </div>
 
       {/* Mode tabs */}
-      <div style={{display:"flex",gap:6,marginBottom:16,overflowX:"auto",paddingBottom:2}}>
+      <div className="scan-mode-wrap">
         {[{id:"search",l:"🔍 Search"},{id:"barcode",l:"📦 Barcode"},{id:"camera",l:"📸 AI Scan"},{id:"manual",l:"✏️ Manual"}].map(m=>(
-          <button key={m.id} onClick={()=>setModeSafe(m.id)} className={`tab-pill ${mode===m.id?"on":"off"}`} style={{flexShrink:0,opacity:!online&&m.id!=="manual"?0.45:1}}>{m.l}{!online&&m.id!=="manual"?" (offline)":""}</button>
+          <button key={m.id} onClick={()=>setModeSafe(m.id)} className={`scan-mode-btn ${mode===m.id?"on":"off"}`} style={{opacity:!online&&m.id!=="manual"?0.45:1}}>{m.l}{!online&&m.id!=="manual"?" (offline)":""}</button>
         ))}
       </div>
 
@@ -2008,7 +2599,7 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
         <div style={{position:"relative",marginBottom:12}}>
           <span style={{position:"absolute",left:14,top:"50%",transform:"translateY(-50%)",color:T.light}}>{Ic.search}</span>
           <input className="inp inp-padl" placeholder="Search foods, brands, meals…" value={searchQ} onChange={e=>onSearchChange(e.target.value)} style={{background:T.white}}/>
-          {searchQ&&<button onClick={()=>{setSearchQ("");setSearchResults([]);setSearchDone(false);}} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:T.light,fontSize:18}}>×</button>}
+          {searchQ&&<button onClick={()=>{setSearchQ("");setSearchResults([]);setSearchAllResults([]);setSearchSections({best:[],local:[],related:[]});setSearchDone(false);setSearchOffset(0);setSearchHasMore(false);setExpandedSearchId(null);}} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:T.light,fontSize:18}}>×</button>}
         </div>
 
         {/* Quick food chips */}
@@ -2021,102 +2612,82 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
           </div>
         </div>}
 
-        {/* Filters — only show when results exist */}
-        {searchDone&&searchResults.length>0&&<div style={{marginBottom:12}}>
-          {/* Calorie filter */}
-          <div style={{marginBottom:8}}>
-            <p style={{fontSize:11,fontWeight:700,color:T.mid,marginBottom:6,textTransform:"uppercase",letterSpacing:.8}}>Calories</p>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {[{v:"all",l:"All"},{v:"low",l:"Low ≤150"},{v:"mid",l:"Mid 150–400"},{v:"high",l:"High >400"}].map(f=>(
-                <button key={f.v} onClick={()=>setFilterCal(f.v)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${filterCal===f.v?T.purple:T.border}`,background:filterCal===f.v?T.lavBg:T.white,color:filterCal===f.v?T.purple:T.mid,fontFamily:"Nunito",fontSize:11,fontWeight:700,cursor:"pointer"}}>{f.l}</button>
-              ))}
-            </div>
-          </div>
-          {/* Category filter */}
-          <div style={{marginBottom:8}}>
-            <p style={{fontSize:11,fontWeight:700,color:T.mid,marginBottom:6,textTransform:"uppercase",letterSpacing:.8}}>Category</p>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {[{v:"all",l:"All"},{v:"indian",l:"🍛 Indian"},{v:"drinks",l:"🥤 Drinks"},{v:"snacks",l:"🍿 Snacks"},{v:"dairy",l:"🥛 Dairy"},{v:"grains",l:"🌾 Grains"}].map(f=>(
-                <button key={f.v} onClick={()=>setFilterCat(f.v)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${filterCat===f.v?T.purple:T.border}`,background:filterCat===f.v?T.lavBg:T.white,color:filterCat===f.v?T.purple:T.mid,fontFamily:"Nunito",fontSize:11,fontWeight:700,cursor:"pointer"}}>{f.l}</button>
-              ))}
-            </div>
-          </div>
-          {/* Sort */}
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <p style={{fontSize:11,fontWeight:700,color:T.mid,textTransform:"uppercase",letterSpacing:.8,flexShrink:0}}>Sort by</p>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {[{v:"relevance",l:"Relevance"},{v:"cal_asc",l:"Calories ↑"},{v:"cal_desc",l:"Calories ↓"},{v:"protein",l:"Protein ↓"}].map(s=>(
-                <button key={s.v} onClick={()=>setSortBy(s.v)} style={{padding:"5px 12px",borderRadius:20,border:`2px solid ${sortBy===s.v?T.purple:T.border}`,background:sortBy===s.v?T.lavBg:T.white,color:sortBy===s.v?T.purple:T.mid,fontFamily:"Nunito",fontSize:11,fontWeight:700,cursor:"pointer"}}>{s.l}</button>
-              ))}
-            </div>
-          </div>
-        </div>}
-
         {/* Loading */}
         {searchLoading&&<div style={{textAlign:"center",padding:"32px 0"}}><div className="aSpin" style={{width:32,height:32,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/><p style={{color:T.mid,fontWeight:600,fontSize:13}}>Searching food database…</p></div>}
 
         {/* Results */}
         {!searchLoading&&searchDone&&<>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-            <p style={{fontSize:13,fontWeight:700,color:T.mid}}>{filteredResults.length} result{filteredResults.length!==1?"s":""} {filterCal!=="all"||filterCat!=="all"?"(filtered)":""}</p>
-            {(filterCal!=="all"||filterCat!=="all")&&<button onClick={()=>{setFilterCal("all");setFilterCat("all");setSortBy("relevance");}} style={{fontSize:11,fontWeight:700,color:T.red,background:"none",border:"none",cursor:"pointer",fontFamily:"Nunito"}}>Clear filters</button>}
+            <p style={{fontSize:13,fontWeight:700,color:T.mid}}>{searchResults.length}/{searchAllResults.length} result{searchAllResults.length!==1?"s":""}</p>
           </div>
-          {filteredResults.length===0&&<div style={{textAlign:"center",padding:"40px 0",color:T.light}}><div style={{fontSize:48,marginBottom:12}}>🔍</div><p style={{fontWeight:600,fontSize:14}}>No results match your filters</p><p style={{fontSize:12,marginTop:4}}>Try adjusting the filters above</p></div>}
-          <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            {filteredResults.slice(0,20).map((food,i)=>(
-              <div key={food.id||i} className="hover-card" style={{background:T.white,borderRadius:16,padding:"12px 14px",boxShadow:`0 2px 10px ${T.shadow}`,border:`2px solid ${res?.id===food.id?T.purple:"transparent"}`}} onClick={()=>{setRes({...food,source:"search"});setPart(1);setAdded(false);}}>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <div style={{width:44,height:44,borderRadius:12,background:T.lavBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>🍽️</div>
-                  <div style={{flex:1,minWidth:0}}>
-                    <p style={{fontWeight:700,fontSize:13,lineHeight:1.3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{food.name}</p>
-                    {food.brand&&<p style={{fontSize:11,color:T.light,marginTop:1}}>{food.brand}</p>}
-                    <div style={{display:"flex",gap:8,marginTop:4}}>
-                      <span style={{fontSize:11,fontWeight:700,color:T.purple}}>{food.cal} kcal</span>
-                      <span style={{fontSize:11,color:T.light}}>P:{food.p}g</span>
-                      <span style={{fontSize:11,color:T.light}}>C:{food.c}g</span>
-                      <span style={{fontSize:11,color:T.light}}>F:{food.f}g</span>
-                    </div>
-                  </div>
-                  <div style={{flexShrink:0}}>
-                    <div style={{width:28,height:28,borderRadius:8,background:res?.id===food.id?T.navy:T.bg,display:"flex",alignItems:"center",justifyContent:"center",transition:"all .15s"}}>
-                      <svg width="12" height="12" fill="none" stroke={res?.id===food.id?T.white:T.light} strokeWidth="2.5" strokeLinecap="round" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-          {res&&<ResultCard/>}
+          {searchAllResults.length===0&&<div style={{textAlign:"center",padding:"40px 0",color:T.light}}><div style={{fontSize:48,marginBottom:12}}>🔍</div><p style={{fontWeight:600,fontSize:14}}>No foods found</p><p style={{fontSize:12,marginTop:4}}>Try another food name</p></div>}
+
+          {searchSections.best.length>0&&<div style={{marginBottom:12}}>
+            <p style={{fontSize:12,fontWeight:800,color:T.mid,letterSpacing:.6,textTransform:"uppercase",marginBottom:8}}>Best Match</p>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {searchSections.best.map((food,i)=><SearchFoodRow key={food.id||i} food={food} icon="🍽️" chipBg={T.lavBg}/>) }
+            </div>
+          </div>}
+
+          {searchSections.local.length>0&&<div style={{marginBottom:12}}>
+            <p style={{fontSize:12,fontWeight:800,color:T.mid,letterSpacing:.6,textTransform:"uppercase",marginBottom:8}}>Local Foods</p>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {searchSections.local.map((food,i)=><SearchFoodRow key={food.id||i} food={food} icon="📍" chipBg={T.mintBg}/>) }
+            </div>
+          </div>}
+
+          {searchSections.related.length>0&&<div style={{marginBottom:6}}>
+            <p style={{fontSize:12,fontWeight:800,color:T.mid,letterSpacing:.6,textTransform:"uppercase",marginBottom:8}}>Related Foods</p>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {searchSections.related.map((food,i)=><SearchFoodRow key={food.id||i} food={food} icon="🥗" chipBg={T.bg}/>) }
+            </div>
+          </div>}
+          
+          {/* Load More Button */}
+          {searchResults.length>0&&searchHasMore&&<div style={{marginTop:20,marginBottom:20,textAlign:"center"}}>
+            <button onClick={loadMoreSearchResults} disabled={searchLoadingMore} style={{background:searchLoadingMore?T.light:T.purple,color:"white",border:"none",borderRadius:12,padding:"12px 24px",fontWeight:700,fontSize:13,cursor:searchLoadingMore?"not-allowed":"pointer",opacity:searchLoadingMore?0.6:1,transition:"all 0.2s"}}>
+              {searchLoadingMore?"Loading...":"Load More"}
+            </button>
+          </div>}
         </>}
       </div>}
 
       {/* ── BARCODE MODE ── */}
       {mode==="barcode"&&<div className="aFadeIn">
-        {barcodeStatus==="idle"&&!res&&<div className="card" style={{textAlign:"center",padding:"28px 20px",marginBottom:16}}>
-          <p style={{fontSize:52,marginBottom:12}}>📦</p>
+        {barcodeStatus==="idle"&&!res&&<div className="card scan-shell scan-idle-dark" style={{textAlign:"center",padding:"30px 20px",marginBottom:16}}>
+          <span className="scan-idle-icon">📦</span>
           <p style={{fontWeight:800,fontSize:17,marginBottom:6}}>Barcode Scanner</p>
-          <p style={{color:T.light,fontSize:13,fontWeight:500,marginBottom:16}}>Scan any product barcode to get real nutrition info from the global food database</p>
+          <p className="scan-idle-sub" style={{fontSize:13,fontWeight:600,marginBottom:16}}>Scan any product barcode to get real nutrition info from the global food database</p>
           {camErr&&<p style={{fontSize:13,color:T.red,fontWeight:600,marginBottom:12}}>{camErr}</p>}
           <button className="btn btn-primary" style={{marginBottom:12}} onClick={startBarcodeCam}>📷 Open Camera</button>
-          <p style={{fontSize:12,color:T.light,marginBottom:8}}>or enter barcode manually</p>
+          <p className="scan-idle-sub" style={{fontSize:12,marginBottom:8}}>or enter barcode manually</p>
           <div style={{display:"flex",gap:8}}>
-            <input className="inp" placeholder="e.g. 8901234567890" value={barcodeInput} onChange={e=>setBarcodeInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&barcodeInput.trim()&&lookupBarcode(barcodeInput.trim())}/>
-            <button className="btn-soft" onClick={()=>barcodeInput.trim()&&lookupBarcode(barcodeInput.trim())}>Lookup</button>
+            <input className="inp" inputMode="numeric" enterKeyHint="search" autoCapitalize="off" autoCorrect="off" placeholder="e.g. 8901234567890" value={barcodeInput} onChange={e=>setBarcodeInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitManualBarcode()}/>
+            <button className="btn-soft" onClick={submitManualBarcode} disabled={barcodeLoading}>Lookup</button>
           </div>
         </div>}
 
-        {barcodeStatus==="opening"&&<div className="card" style={{marginBottom:16,textAlign:"center",padding:"24px 18px"}}>
-          <div className="aSpin" style={{width:34,height:34,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/>
-          <p style={{fontSize:14,fontWeight:800,marginBottom:4}}>Opening camera…</p>
-          <p style={{fontSize:12,color:T.light,fontWeight:600}}>This can take a few seconds on some phones</p>
-          <button className="btn btn-ghost" style={{marginTop:12}} onClick={()=>{stopBarcodeCam();setBarcodeStatus("idle");}}>Cancel</button>
+        {barcodeStatus==="loading"&&<div className="card scan-shell" style={{marginBottom:16}}>
+          <div className="camera-frame">
+            {isNativeApp()
+              ?<div id="barcode-preview-host" style={{position:"absolute",inset:0,zIndex:1,background:"#000"}}/>
+              :<div style={{position:"absolute",inset:0,zIndex:1,background:"#000"}}/>}
+            <div style={{position:"absolute",inset:0,zIndex:2,background:"rgba(0,0,0,.42)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+              <div className="aSpin" style={{width:34,height:34,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/>
+              <p style={{fontSize:14,fontWeight:800,color:"white",marginBottom:4}}>Opening camera...</p>
+              <p style={{fontSize:12,color:"rgba(255,255,255,.8)",fontWeight:600}}>This can take 3–4 seconds on some phones</p>
+            </div>
+          </div>
+          <button className="btn btn-ghost" onClick={()=>{stopBarcodeCam();setBarcodeStatus("idle");}}>Cancel</button>
         </div>}
 
-        {barcodeStatus==="scanning"&&<div className="card" style={{marginBottom:16}}>
-          <div style={{borderRadius:16,overflow:"hidden",aspectRatio:"4/3",background:"#000",marginBottom:12,position:"relative"}}>
-            <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"cover"}} playsInline muted autoPlay/>
+        {barcodeStatus==="scanning"&&<div className="card scan-shell" style={{marginBottom:16}}>
+          <div className="camera-frame">
+            {isNativeApp()
+              ?<div id="barcode-preview-host" style={{position:"absolute",inset:0,zIndex:1,background:"#000"}}/>
+              :<video ref={videoRef} style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover",zIndex:1}} playsInline muted autoPlay/>}
             <div className="scan-line"/>
-            <div style={{position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:"rgba(0,0,0,.75)",borderRadius:20,padding:"6px 16px",display:"flex",alignItems:"center",gap:8}}>
+            <div className="scan-hud">
               <div style={{width:8,height:8,borderRadius:"50%",background:T.lav,animation:"blink 1s ease-in-out infinite"}}/>
               <span style={{fontSize:12,color:"white",fontWeight:600}}>Scanning for barcode…</span>
             </div>
@@ -2124,16 +2695,16 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
           <button className="btn btn-ghost" onClick={()=>{stopBarcodeCam();setBarcodeStatus("idle");}}>Cancel</button>
         </div>}
 
-        {barcodeStatus==="manual-barcode"&&<div className="card" style={{marginBottom:16}}>
+        {barcodeStatus==="manual-barcode"&&<div className="card scan-shell" style={{marginBottom:16}}>
           <p style={{fontWeight:700,fontSize:13,marginBottom:8,color:T.mid}}>Auto-scan not supported. Enter barcode manually:</p>
           <div style={{display:"flex",gap:8,marginBottom:10}}>
-            <input className="inp" placeholder="e.g. 8901234567890" value={barcodeInput} onChange={e=>setBarcodeInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&barcodeInput.trim()&&(stopBarcodeCam(),setBarcodeStatus("idle"),lookupBarcode(barcodeInput.trim()))} style={{flex:1}}/>
-            <button className="btn-soft" onClick={()=>{if(barcodeInput.trim()){stopBarcodeCam();setBarcodeStatus("idle");lookupBarcode(barcodeInput.trim());}}}>Lookup</button>
+            <input className="inp" inputMode="numeric" enterKeyHint="search" autoCapitalize="off" autoCorrect="off" placeholder="e.g. 8901234567890" value={barcodeInput} onChange={e=>setBarcodeInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitManualBarcode()} style={{flex:1}}/>
+            <button className="btn-soft" onClick={submitManualBarcode} disabled={barcodeLoading}>Lookup</button>
           </div>
           <button className="btn btn-ghost" onClick={()=>{stopBarcodeCam();setBarcodeStatus("idle");}}>Cancel</button>
         </div>}
 
-        {barcodeLoading&&<div className="card" style={{textAlign:"center",padding:"24px"}}>
+        {barcodeLoading&&<div className="card scan-shell" style={{textAlign:"center",padding:"24px"}}>
           <div className="aSpin" style={{width:36,height:36,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/>
           <p style={{fontWeight:700,color:T.mid}}>Looking up product…</p>
         </div>}
@@ -2149,31 +2720,47 @@ function Scanner({onAddMeal,toast,user,online=true,playSfx}){
 
       {/* ── AI CAMERA MODE ── */}
       {mode==="camera"&&<div className="aFadeIn">
-        <div style={{borderRadius:22,overflow:"hidden",aspectRatio:"4/3",background:"#0a0a0a",position:"relative",marginBottom:14,boxShadow:`0 8px 30px ${T.shadow}`}}>
-          {cameraOn
-            ?<video ref={videoAiRef} style={{width:"100%",height:"100%",objectFit:"cover"}} playsInline muted autoPlay/>
-            :<div style={{position:"absolute",inset:0,background:"radial-gradient(ellipse at 50% 50%,#182210,#060a04)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12}}>
-              <div style={{fontSize:64}}>📸</div>
-              <p style={{color:"rgba(255,255,255,.6)",fontSize:13,fontWeight:600}}>Camera off</p>
-            </div>}
-          {[[{top:"8%",left:"8%"},3,3,0,0],[{top:"8%",right:"8%"},3,0,3,0],[{bottom:"8%",left:"8%"},0,3,0,3],[{bottom:"8%",right:"8%"},0,0,3,3]].map(([pos,bt,bl,br,bb],i)=><div key={i} style={{position:"absolute",width:26,height:26,borderColor:"white",borderStyle:"solid",borderTopWidth:bt,borderLeftWidth:bl,borderRightWidth:br,borderBottomWidth:bb,...pos,zIndex:2,opacity:.7}}/>)}
-          {scan&&<div className="scan-line"/>}
-          {aiLoading&&<div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.6)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12}}>
-            <div className="aSpin" style={{width:40,height:40,border:"3px solid rgba(255,255,255,.3)",borderTop:"3px solid white",borderRadius:"50%"}}/>
-            <p style={{color:"white",fontWeight:700,fontSize:13}}>AI analyzing food…</p>
-          </div>}
-          <canvas ref={canvasRef} style={{display:"none"}}/>
-        </div>
-        <div style={{display:"flex",gap:10,marginBottom:14}}>
-          {!cameraOn
-            ?<button className="btn btn-primary" onClick={startAiCamera}>📷 Open Camera</button>
-            :<><button className="btn btn-primary" onClick={doAiScan} disabled={aiLoading} style={{flex:2}}>🤖 Scan Food with AI</button>
-              <button className="btn btn-ghost" onClick={stopAiCamera} style={{flex:1}}>Stop</button></>}
-        </div>
-        <div className="card" style={{marginBottom:12}}>
+        {aiScanStatus==="idle"&&!res&&<div className="card scan-shell scan-idle-dark" style={{textAlign:"center",padding:"30px 20px",marginBottom:16}}>
+          <span className="scan-idle-icon">🤖</span>
+          <p style={{fontWeight:800,fontSize:18,marginBottom:6}}>Scan food with AI</p>
+          <p className="scan-idle-sub" style={{fontSize:13,fontWeight:600,marginBottom:16}}>Open your camera to start scanning</p>
+          {camErr&&<p style={{fontSize:13,color:T.red,fontWeight:600,marginBottom:12}}>{camErr}</p>}
+          <button className="btn btn-primary" style={{marginBottom:2}} onClick={startAiCamera}>Open Camera</button>
+        </div>}
+
+        {aiScanStatus==="loading"&&<div className="card scan-shell" style={{marginBottom:16}}>
+          <div className="camera-frame">
+            <div style={{position:"absolute",inset:0,zIndex:2,background:"rgba(0,0,0,.42)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+              <div className="aSpin" style={{width:34,height:34,border:`3px solid ${T.lav}`,borderTop:`3px solid ${T.purple}`,borderRadius:"50%",margin:"0 auto 12px"}}/>
+              <p style={{fontSize:14,fontWeight:800,color:"white",marginBottom:4}}>Opening camera...</p>
+              <p style={{fontSize:12,color:"rgba(255,255,255,.8)",fontWeight:600}}>This can take 3–4 seconds on some phones</p>
+            </div>
+          </div>
+          <button className="btn btn-ghost" onClick={()=>{stopAiCamera();setAiScanStatus("idle");}}>Cancel</button>
+        </div>}
+
+        {aiScanStatus==="scanning"&&<div className="card scan-shell" style={{marginBottom:16}}>
+          <div className="camera-frame">
+            <video ref={videoAiRef} style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover",zIndex:1}} playsInline muted autoPlay/>
+            {[[{top:"8%",left:"8%"},3,3,0,0],[{top:"8%",right:"8%"},3,0,3,0],[{bottom:"8%",left:"8%"},0,3,0,3],[{bottom:"8%",right:"8%"},0,0,3,3]].map(([pos,bt,bl,br,bb],i)=><div key={i} style={{position:"absolute",width:26,height:26,borderColor:"white",borderStyle:"solid",borderTopWidth:bt,borderLeftWidth:bl,borderRightWidth:br,borderBottomWidth:bb,...pos,zIndex:2,opacity:.7}}/>)}
+            {scan&&<div className="scan-line"/>}
+            <div className="scan-hud" style={{zIndex:3}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:T.lav,animation:"blink 1s ease-in-out infinite"}}/>
+              <span style={{fontSize:12,color:"white",fontWeight:600}}>Analyzing food…</span>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button className="btn btn-primary" onClick={doAiScan} disabled={scan} style={{flex:1}}>🤖 Scan</button>
+            <button className="btn btn-ghost" onClick={stopAiCamera} style={{flex:1}}>Stop</button>
+          </div>
+        </div>}
+
+        {aiScanStatus!=="idle"&&<div className="card scan-shell" style={{marginBottom:12}}>
           <p style={{fontSize:13,fontWeight:700,marginBottom:8}}>💡 Tips for best results</p>
           {["Hold camera 20–30cm from food","Good lighting helps accuracy","Works best with single dishes","Indian foods recognized well"].map(t=><p key={t} style={{fontSize:12,color:T.mid,marginBottom:4}}>• {t}</p>)}
-        </div>
+        </div>}
+        
+        <canvas ref={canvasRef} style={{display:"none"}}/>
         {res&&<ResultCard/>}
       </div>}
 
@@ -2478,6 +3065,9 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
   const tdee=fTDEE(bmr,user.activity),tgt=fTarget(tdee,user.goal);
   const bmi=parseFloat(fBMI(user.weight,user.height)),bi=fBMIlabel(bmi);
   const avatarLetter=(user?.name?.trim?.()?.[0]||"U").toUpperCase();
+  const sleepHour=Math.min(23,Math.max(0,parseInt(settings?.sleepReminderHour,10)||0));
+  const sleepMinute=Math.min(59,Math.max(0,parseInt(settings?.sleepReminderMinute,10)||0));
+  const sleepTimeLabel=new Date(2000,0,1,sleepHour,sleepMinute,0,0).toLocaleTimeString([], {hour:"numeric",minute:"2-digit",hour12:true});
 
   useEffect(()=>{
     const idx=PROFILE_GALLERY_IMAGES.findIndex(u=>u===user?.profileImageUrl);
@@ -2493,6 +3083,7 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       platform:isNativeApp()?"Native app":"Web",
       camera:"Unknown",
       notifications:"Unknown",
+      exactAlarm:"Unknown",
       checkedAt:new Date().toLocaleString(),
     };
     if(isNativeApp()){
@@ -2508,13 +3099,39 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       }catch(e){
         info.notifications="error";
       }
+      try{
+        if(typeof LocalNotifications.checkExactNotificationSetting==="function"){
+          const exact=await LocalNotifications.checkExactNotificationSetting();
+          info.exactAlarm=exact?.value||"unknown";
+        }else info.exactAlarm="not supported";
+      }catch(e){
+        info.exactAlarm="error";
+      }
     }else{
       info.camera="n/a (web)";
       info.notifications="n/a (web)";
+      info.exactAlarm="n/a (web)";
     }
     setDiag(info);
     setDiagLoading(false);
     toast("Diagnostics updated","🩺");
+  };
+
+  const runNotificationDiagnostic=async()=>{
+    if(!isNativeApp()){
+      toast("Notification test is available on mobile app only.","ℹ️");
+      return;
+    }
+    const testAt=new Date(Date.now()+60*1000);
+    const ok=await scheduleDailyReminderExample({
+      id:3998,
+      title:"🧪 Notification Diagnostic",
+      body:"If you see this at the expected minute, local notification timing is healthy.",
+      hour:testAt.getHours(),
+      minute:testAt.getMinutes(),
+    });
+    if(ok)toast(`Test notification scheduled for ${testAt.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"})}`,"⏰");
+    else toast("Couldn't schedule test notification.","❌");
   };
 
   const changeProfilePicture=async()=>{
@@ -2542,16 +3159,11 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       const ext=fmt==="jpg"?"jpeg":(fmt||"jpeg");
       const mime=ext==="png"?"image/png":ext==="webp"?"image/webp":"image/jpeg";
       const blob=base64ToBlob(photo.base64String,mime);
-      const path=`${user.id}/avatar_${Date.now()}.${ext}`;
-      await supa.uploadStorageObject(user.token,PROFILE_IMAGE_BUCKET,path,blob,mime);
-      const publicUrl=supa.storagePublicUrl(PROFILE_IMAGE_BUCKET,path);
+      const filename=`avatar_${Date.now()}.${ext}`;
+      const publicUrl=await uploadProfileImageToCloudinary(blob,filename);
       const ok=await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{profile_image_url:publicUrl});
       if(!ok){
-        await supa.removeStorageObject(user.token,PROFILE_IMAGE_BUCKET,path).catch(()=>null);
         throw new Error("Couldn't save profile image URL");
-      }
-      if(oldPath&&oldPath!==path){
-        await supa.removeStorageObject(user.token,PROFILE_IMAGE_BUCKET,oldPath).catch(()=>null);
       }
       setUser(prev=>prev?{...prev,profileImageUrl:publicUrl,lastAvatarUpdate:new Date().toISOString()}:prev);
       setEditForm(prev=>({...prev,profileImageUrl:publicUrl}));
@@ -2575,16 +3187,23 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
     }
     setProfileImageUploading(true);
     try{
-      const oldUrl=String(user?.profileImageUrl||"");
-      const oldPath=extractStorageObjectPath(oldUrl,PROFILE_IMAGE_BUCKET);
-      const ok=await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{profile_image_url:imageUrl});
+      let finalUrl=String(imageUrl||"");
+      try{
+        const assetRes=await fetch(imageUrl);
+        if(assetRes.ok){
+          const assetBlob=await assetRes.blob();
+          const assetExt=((assetBlob.type||"image/jpeg").split("/")[1]||"jpeg").toLowerCase();
+          const fileExt=assetExt==="svg+xml"?"svg":assetExt;
+          const cloudUrl=await uploadProfileImageToCloudinary(assetBlob,`app_avatar_${idx+1}_${Date.now()}.${fileExt}`);
+          if(cloudUrl)finalUrl=cloudUrl;
+        }
+      }catch(_e){}
+
+      const ok=await supa.patch(user.token,"profiles",`id=eq.${user.id}`,{profile_image_url:finalUrl});
       if(!ok)throw new Error("Couldn't save profile image");
-      if(oldPath){
-        await supa.removeStorageObject(user.token,PROFILE_IMAGE_BUCKET,oldPath).catch(()=>null);
-      }
       setProfileAvatar(idx);
-      setUser(prev=>prev?{...prev,profileImageUrl:imageUrl,lastAvatarUpdate:new Date().toISOString()}:prev);
-      setEditForm(prev=>({...prev,profileImageUrl:imageUrl}));
+      setUser(prev=>prev?{...prev,profileImageUrl:finalUrl,lastAvatarUpdate:new Date().toISOString()}:prev);
+      setEditForm(prev=>({...prev,profileImageUrl:finalUrl}));
       toast("Profile photo updated!","🖼️");
       setSheet(null);
     }catch(e){
@@ -2791,6 +3410,7 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
         <p style={{fontSize:15,fontWeight:800,marginBottom:4}}>Notifications</p>
         <SettingRow icon={Ic.food} iconBg={T.pinkBg} label="Meal Reminders (Phone)" sub={settings.mealReminders?"Phone reminders + nudges are on":"Phone reminders are off"} right={<Toggle on={settings.mealReminders} set={v=>{setSetting("mealReminders",v);toast(v?"Phone meal reminders on":"Phone meal reminders off",v?"🍽️":"🔕");}}/>}/>
         <SettingRow icon={Ic.drop} iconBg={T.lavBg} label="Water Reminders (Phone)" sub={settings.waterReminders?"Every 2 hours (9:00 AM–9:00 PM)":"Off"} right={<Toggle on={settings.waterReminders} set={v=>{setSetting("waterReminders",v);toast(v?"Phone water reminders on (9:00 AM–9:00 PM)":"Phone water reminders off",v?"💧":"🔕");}}/>}/>
+        <SettingRow icon={Ic.moon} iconBg={T.mintBg} label="Sleep Reminder (Phone)" sub={settings.sleepReminderEnabled?`Daily at ${sleepTimeLabel}`:"Off"} right={<Toggle on={!!settings.sleepReminderEnabled} set={v=>{setSetting("sleepReminderEnabled",v);toast(v?`Sleep reminder on (${sleepTimeLabel})`:"Sleep reminder off",v?"🌙":"🔕");}}/>} onClick={()=>setSheet("sleepReminder")}/>
         <SettingRow icon={Ic.heart} iconBg={T.mintBg} label="Health Insights" sub={settings.healthInsights?"Weekly AI insights":"Off"} right={<Toggle on={settings.healthInsights} set={v=>{setSetting("healthInsights",v);toast(v?"Health insights on":"Health insights off",v?"🤖":"🔕");}}/>}/>
         <SettingRow icon={Ic.trophy} iconBg={T.peachBg} label="Achievement Alerts (In-App)" sub={settings.achievementAlerts?"Milestones shown inside app":"Off"} right={<Toggle on={settings.achievementAlerts} set={v=>{setSetting("achievementAlerts",v);toast(v?"In-app achievement alerts on":"In-app achievement alerts off",v?"🏆":"🔕");}}/>}/>
       </div>
@@ -2861,6 +3481,31 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
       </div>
     </Sheet>}
 
+    {sheet==="sleepReminder"&&<Sheet title="🌙 Sleep Reminder" onClose={()=>setSheet(null)}>
+      <div style={{display:"flex",flexDirection:"column",gap:14,marginBottom:18}}>
+        <p style={{fontSize:13,color:T.mid,fontWeight:600}}>Choose the exact time for your daily sleep reminder.</p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div>
+            <label className="flabel">Hour (0–23)</label>
+            <select className="inp" value={sleepHour} onChange={e=>setSetting("sleepReminderHour",parseInt(e.target.value,10))}>
+              {Array.from({length:24},(_,h)=><option key={h} value={h}>{String(h).padStart(2,"0")}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="flabel">Minute</label>
+            <select className="inp" value={sleepMinute} onChange={e=>setSetting("sleepReminderMinute",parseInt(e.target.value,10))}>
+              {Array.from({length:60},(_,m)=><option key={m} value={m}>{String(m).padStart(2,"0")}</option>)}
+            </select>
+          </div>
+        </div>
+        <p style={{fontSize:13,fontWeight:700,color:T.navy}}>Current: {sleepTimeLabel}</p>
+      </div>
+      <div style={{display:"flex",gap:10}}>
+        <button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.border}`}} onClick={()=>setSetting("sleepReminderEnabled",false)}>Turn Off</button>
+        <button className="btn btn-primary" style={{flex:1}} onClick={()=>{setSetting("sleepReminderEnabled",true);toast(`Sleep reminder set for ${sleepTimeLabel}`,"🌙");setSheet(null);}}>Save</button>
+      </div>
+    </Sheet>}
+
     {/* Change Password */}
     {sheet==="password"&&<Sheet title="🔑 Change Password" onClose={()=>setSheet(null)}>
       <div style={{display:"flex",flexDirection:"column",gap:14,marginBottom:20}}>
@@ -2927,11 +3572,14 @@ function Settings({user,setUser,toast,onSignOut,settings,setSetting,meals=[],onD
         <p style={{fontSize:13,color:T.mid,fontWeight:700,marginBottom:10}}>Quick status checks</p>
         {diagLoading&&<p style={{fontSize:13,color:T.mid}}>Checking…</p>}
         {!diagLoading&&diag&&<div style={{display:"grid",gap:8}}>
-          {[{k:"Network",v:diag.network},{k:"Auth",v:diag.auth},{k:"AI Key",v:diag.aiKey},{k:"Platform",v:diag.platform},{k:"Camera",v:diag.camera},{k:"Notifications",v:diag.notifications}].map(item=><div key={item.k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",background:T.bg,borderRadius:12}}><span style={{fontSize:12,fontWeight:700,color:T.mid}}>{item.k}</span><span style={{fontSize:12,fontWeight:800}}>{item.v}</span></div>)}
+          {[{k:"Network",v:diag.network},{k:"Auth",v:diag.auth},{k:"AI Key",v:diag.aiKey},{k:"Platform",v:diag.platform},{k:"Camera",v:diag.camera},{k:"Notifications",v:diag.notifications},{k:"Exact Alarm",v:diag.exactAlarm}].map(item=><div key={item.k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",background:T.bg,borderRadius:12}}><span style={{fontSize:12,fontWeight:700,color:T.mid}}>{item.k}</span><span style={{fontSize:12,fontWeight:800}}>{item.v}</span></div>)}
           <p style={{fontSize:11,color:T.light,marginTop:4}}>Last checked: {diag.checkedAt}</p>
         </div>}
       </div>
-      <button className="btn btn-primary" onClick={runDiagnostics} disabled={diagLoading}>{diagLoading?"Checking…":"Run Diagnostics Again"}</button>
+      <div style={{display:"flex",gap:10}}>
+        <button className="btn btn-primary" style={{flex:1}} onClick={runDiagnostics} disabled={diagLoading}>{diagLoading?"Checking…":"Run Diagnostics Again"}</button>
+        <button className="btn btn-ghost" style={{flex:1,border:`2px solid ${T.border}`}} onClick={runNotificationDiagnostic}>Test Notification (+1 min)</button>
+      </div>
     </Sheet>}
 
     {/* Clear Data Confirmation */}
@@ -3131,6 +3779,44 @@ function AiChat({user,meals,toast,online=true}){
 /* ══════════════ BOTTOM NAV ══════════════ */
 function BottomNav({active,setActive}){
   const tabs=[{id:"dashboard",label:"Home"},{id:"analytics",label:"Stats"},{id:"scanner",label:"Scan"},{id:"ai",label:"AI Chat"},{id:"settings",label:"Settings"}];
+  const navRef=useRef(null);
+  const iconRefs=useRef({});
+  const [indicator,setIndicator]=useState({x:0,y:0,w:0,h:0,ready:false});
+
+  const refreshIndicator=useCallback(()=>{
+    const navEl=navRef.current;
+    const activeIcon=iconRefs.current[active];
+    if(!navEl||!activeIcon)return;
+    const navRect=navEl.getBoundingClientRect();
+    const iconRect=activeIcon.getBoundingClientRect();
+    const next={
+      x:iconRect.left-navRect.left,
+      y:iconRect.top-navRect.top,
+      w:iconRect.width,
+      h:iconRect.height,
+      ready:true
+    };
+    setIndicator(prev=>{
+      const stable=Math.abs(prev.x-next.x)<0.5&&Math.abs(prev.y-next.y)<0.5&&Math.abs(prev.w-next.w)<0.5&&Math.abs(prev.h-next.h)<0.5&&prev.ready;
+      return stable?prev:next;
+    });
+  },[active]);
+
+  useLayoutEffect(()=>{
+    refreshIndicator();
+  },[refreshIndicator]);
+
+  useEffect(()=>{
+    const onResize=()=>refreshIndicator();
+    window.addEventListener("resize",onResize);
+    return()=>window.removeEventListener("resize",onResize);
+  },[refreshIndicator]);
+
+  useEffect(()=>{
+    const raf=requestAnimationFrame(refreshIndicator);
+    return()=>cancelAnimationFrame(raf);
+  },[active,refreshIndicator]);
+
   const P={
     dashboard:<><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></>,
     analytics:<><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></>,
@@ -3138,7 +3824,17 @@ function BottomNav({active,setActive}){
     ai:<><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></>,
     settings:<><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></>,
   };
-  return <div className="bnav">{tabs.map(t=><button key={t.id} className={`nb${active===t.id?" active":""}`} onClick={()=>setActive(t.id)}><div className="nb-icon"><svg width="20" height="20" fill="none" stroke={active===t.id?T.white:T.light} strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">{P[t.id]}</svg></div><span>{t.label}</span></button>)}</div>;
+  return <div className="bnav" ref={navRef}>
+    <span
+      className={`bnav-indicator${indicator.ready?" ready":""}`}
+      style={{
+        transform:`translate3d(${indicator.x}px,${indicator.y}px,0)`,
+        width:indicator.w,
+        height:indicator.h
+      }}
+    />
+    {tabs.map(t=><button key={t.id} className={`nb${active===t.id?" active":""}`} onClick={()=>setActive(t.id)}><div className="nb-icon" ref={el=>{if(el)iconRefs.current[t.id]=el;}}><svg width="20" height="20" fill="none" stroke={active===t.id?T.white:T.light} strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">{P[t.id]}</svg></div><span>{t.label}</span></button>)}
+  </div>;
 }
 
 function buildInAppProgressNotifications({user,meals,water,streak}){
@@ -3255,12 +3951,14 @@ function SplashScreen(){
 
 /* ══════════════ ROOT APP ══════════════ */
 export default function App(){
-  const DEFAULT_SETTINGS={mealReminders:true,waterReminders:true,healthInsights:true,achievementAlerts:true,darkMode:false,offline:true};
+  const DEFAULT_SETTINGS={mealReminders:true,waterReminders:true,sleepReminderEnabled:false,sleepReminderHour:22,sleepReminderMinute:30,healthInsights:true,achievementAlerts:true,darkMode:false,offline:true};
+  const defaultDate=ymdLocal(new Date());
   const [splash,setSplash]=useState(true);   // 4s splash
   const [authReady,setAuthReady]=useState(false);
   const [screen,setScreen]=useState("landing");
   const [tab,setTab]=useState("dashboard");
   const [user,setUser]=useState(null);        // includes .token
+  const [selectedDate,setSelectedDate]=useState(defaultDate);
   const [meals,setMeals]=useState([]);
   const [water,setWater]=useState(0);
   const [online,setOnline]=useState(()=>netOnline());
@@ -3269,12 +3967,32 @@ export default function App(){
   const [showAch,setShowAch]=useState(false);
   const [mealStreak,setMealStreak]=useState(0);
   const [readNotifIds,setReadNotifIds]=useState(()=>new Set());
-  const [settings,setSettings]=useState(()=>{try{return JSON.parse(localStorage.getItem("nutriscan_settings"))||DEFAULT_SETTINGS;}catch(e){return DEFAULT_SETTINGS;}});
+  const [settings,setSettings]=useState(()=>{try{return {...DEFAULT_SETTINGS,...(JSON.parse(localStorage.getItem("nutriscan_settings"))||{})};}catch(e){return DEFAULT_SETTINGS;}});
   const [soundFxEnabled,setSoundFxEnabled]=useState(()=>{try{return JSON.parse(localStorage.getItem("nutriscan_sound_fx")||"true");}catch(e){return true;}});
   const [firstSyncLoading,setFirstSyncLoading]=useState(false);
-    const [signupInitialData,setSignupInitialData]=useState(null);
+  const [signupInitialData,setSignupInitialData]=useState(null);
+  const [syncingDate,setSyncingDate]=useState(null);
   const {toasts,add:toast}=useToasts();
   const prevMealStreakRef=useRef(0);
+  const loadUserDataReqRef=useRef(0);
+  const nonTodayEditWarnedRef=useRef(false);
+
+  const warnNonTodayEditOnce=useCallback(()=>{
+    const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+    const todayKey=ymdLocal(new Date());
+    if(logDate===todayKey){
+      nonTodayEditWarnedRef.current=false;
+      return;
+    }
+    if(nonTodayEditWarnedRef.current)return;
+    nonTodayEditWarnedRef.current=true;
+    toast("ℹ️ You're modifying a non-today date. Changes will sync.","ℹ️");
+  },[selectedDate,toast]);
+
+  useEffect(()=>{
+    const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+    if(logDate===ymdLocal(new Date()))nonTodayEditWarnedRef.current=false;
+  },[selectedDate]);
 
   const playAppSfx=useCallback((name="success")=>playSfx(name,soundFxEnabled),[soundFxEnabled]);
 
@@ -3430,36 +4148,70 @@ export default function App(){
     return()=>{listener?.remove();};
   },[]);
 
-  /* ── Load meals, water, settings from Supabase (or local cache when offline) ── */
-  const loadUserData=async(token,uid)=>{
-    const today=new Date().toISOString().split("T")[0];
-    if(!netOnline()){
-      const c=loadLocalDay(uid,today);
-      if(c.meals&&c.meals.length)setMeals(c.meals);
-      if(c.water!=null)setWater(c.water);
+  /* ── Load meals/water local-first, then background-sync with Supabase ── */
+  const loadUserData=async(token,uid,forDate)=>{
+    const requestId=++loadUserDataReqRef.current;
+    const dateKey=String(forDate||ymdLocal(new Date())).slice(0,10);
+    setSyncingDate(dateKey);
+
+    const localState=loadLocalDay(uid,dateKey);
+    const localMeals=normalizeMealList(Array.isArray(localState.meals)?localState.meals:[]);
+    const localWater=Number.isFinite(+localState.water)?+localState.water:0;
+    if(requestId===loadUserDataReqRef.current){
+      setMeals(localMeals);
+      setWater(localWater);
+    }
+
+    if(!netOnline()||!token){
+      if(requestId===loadUserDataReqRef.current)setSyncingDate(null);
       return;
     }
+
     try{
-      const m=await supa.select(token,"meals","*",`&user_id=eq.${uid}&log_date=eq.${today}&order=logged_at.asc`);
-      const mealState=Array.isArray(m)&&m.length>0
+      const m=await supa.select(token,"meals","*",`&user_id=eq.${uid}&log_date=eq.${dateKey}&order=logged_at.asc`);
+      const remoteMealsRaw=Array.isArray(m)&&m.length>0
         ?m.map(x=>({id:x.id,name:x.name,cal:x.calories,p:x.protein,c:x.carbs,f:x.fat,e:x.emoji,m:x.meal_type,t:new Date(x.logged_at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}))
         :[];
-      setMeals(mealState);
-      const w=await supa.select(token,"water_logs","glasses",`&user_id=eq.${uid}&log_date=eq.${today}`);
-      const wv=Array.isArray(w)&&w[0]?+w[0].glasses:0;
-      setWater(wv);
-      saveLocalDay(uid,today,mealState,wv);
+      const remoteMeals=normalizeMealList(remoteMealsRaw);
+      const w=await supa.select(token,"water_logs","glasses",`&user_id=eq.${uid}&log_date=eq.${dateKey}`);
+      const remoteWater=Array.isArray(w)&&w[0]?+w[0].glasses:0;
+
+      if(requestId!==loadUserDataReqRef.current)return;
+
+      const changed=!dayStateEquals(localMeals,localWater,remoteMeals,remoteWater);
+      if(changed){
+        setMeals(remoteMeals);
+        setWater(remoteWater);
+        saveLocalDay(uid,dateKey,remoteMeals,remoteWater);
+      }
+
       const st=await supa.select(token,"settings","*",`&user_id=eq.${uid}`);
+      if(requestId!==loadUserDataReqRef.current)return;
       if(Array.isArray(st)&&st[0]){
         const s=st[0];
-        setSettings({mealReminders:s.meal_reminders,waterReminders:s.water_reminders,healthInsights:s.health_insights,achievementAlerts:s.achievement_alerts,darkMode:s.dark_mode,offline:s.offline_mode});
+        setSettings(prev=>({
+          ...DEFAULT_SETTINGS,
+          ...prev,
+          mealReminders:s.meal_reminders,
+          waterReminders:s.water_reminders,
+          healthInsights:s.health_insights,
+          achievementAlerts:s.achievement_alerts,
+          darkMode:s.dark_mode,
+          offline:s.offline_mode,
+        }));
       }
     }catch(e){
-      const c=loadLocalDay(uid,today);
-      if(c.meals&&c.meals.length)setMeals(c.meals);
-      if(c.water!=null)setWater(c.water);
+      // Keep local-first state; sync failures should not block UI.
+    }finally{
+      if(requestId===loadUserDataReqRef.current)setSyncingDate(null);
     }
   };
+
+  useEffect(()=>{
+    if(screen!=="app"||!user?.id)return;
+    const currentDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+    loadUserData(user.token,user.id,currentDate);
+  },[screen,user?.id,user?.token,selectedDate]);
 
   /* ── Online / offline + sync queued manual changes to Supabase ── */
   useEffect(()=>{
@@ -3467,26 +4219,26 @@ export default function App(){
       setOnline(true);
       if(user?.token){
         await flushOfflineQueue(user,toast);
-        await loadUserData(user.token,user.id);
+        await loadUserData(user.token,user.id,selectedDate);
       }
     };
     const off=()=>setOnline(false);
     window.addEventListener("online",on);
     window.addEventListener("offline",off);
     return()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
-  },[user?.token,user?.id]);
+  },[user?.token,user?.id,selectedDate]);
 
   useEffect(()=>{
     const onVisible=async()=>{
       if(document.visibilityState!=="visible")return;
       if(user?.token&&user?.id&&netOnline()){
         await flushOfflineQueue(user,toast);
-        await loadUserData(user.token,user.id);
+        await loadUserData(user.token,user.id,selectedDate);
       }
     };
     document.addEventListener("visibilitychange",onVisible);
     return()=>document.removeEventListener("visibilitychange",onVisible);
-  },[user?.token,user?.id,meals.length,water]);
+  },[user?.token,user?.id,selectedDate,meals.length,water]);
 
   useEffect(()=>{
     if(!user?.id)return;
@@ -3537,8 +4289,26 @@ export default function App(){
 
   useEffect(()=>{
     if(screen!=="app"||!user?.id)return;
-    syncMealWaterReminders({mealReminders:settings.mealReminders,waterReminders:settings.waterReminders,meals,water});
-  },[screen,user?.id,settings.mealReminders,settings.waterReminders,meals,water]);
+    const todayForSync=ymdLocal(new Date());
+    if(selectedDate!==todayForSync)return;
+    const eaten=meals.reduce((a,m)=>a+(+m.cal||0),0);
+    const b=fBMR(user.gender,+user.weight,+user.height,+user.age);
+    const calorieTarget=fTarget(fTDEE(b,user.activity),user.goal);
+    const streakJustHit7=mealStreak===7;
+    syncMealWaterReminders({
+      mealReminders:settings.mealReminders,
+      waterReminders:settings.waterReminders,
+      sleepReminderEnabled:settings.sleepReminderEnabled,
+      sleepReminderHour:settings.sleepReminderHour,
+      sleepReminderMinute:settings.sleepReminderMinute,
+      meals,
+      water,
+      caloriesEaten:eaten,
+      calorieTarget:calorieTarget,
+      currentStreak:mealStreak,
+      streakJustHit7:streakJustHit7
+    });
+  },[screen,user?.id,settings.mealReminders,settings.waterReminders,settings.sleepReminderEnabled,settings.sleepReminderHour,settings.sleepReminderMinute,meals,water,mealStreak,user?.gender,user?.weight,user?.height,user?.age,user?.activity,user?.goal,selectedDate]);
 
   /* ── Persist water to Supabase (queue when offline) ── */
   const setWaterAndSave=async(val)=>{
@@ -3547,14 +4317,15 @@ export default function App(){
     setWater(v);
     if(v>prevWater)playAppSfx("water");
     if(user?.id){
-      const today=new Date().toISOString().split("T")[0];
-      saveLocalDay(user.id,today,meals,v);
+      const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+      if(logDate!==ymdLocal(new Date()))warnNonTodayEditOnce();
+      saveLocalDay(user.id,logDate,meals,v);
     }
     if(!user?.token)return;
-    const today=new Date().toISOString().split("T")[0];
-    const payload={user_id:user.id,glasses:v,log_date:today,updated_at:new Date().toISOString()};
+    const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+    const payload={user_id:user.id,glasses:v,log_date:logDate,updated_at:new Date().toISOString()};
     if(!netOnline()){enqueueOffline({kind:"water",payload});return;}
-    try{await supa.upsert(user.token,"water_logs",payload);}catch(e){enqueueOffline({kind:"water",payload});}
+    try{await supa.upsert(user.token,"water_logs",payload);}catch(e){logAppError(e,"water_save_failed");enqueueOffline({kind:"water",payload});toast("Network issue — water log queued for sync","⚠️");}
   };
 
   /* ── Persist meals to Supabase (queue when offline) ── */
@@ -3564,29 +4335,30 @@ export default function App(){
     setMeals(next);
     if(next.length>prev.length)playAppSfx("success");
     if(user?.id){
-      const today=new Date().toISOString().split("T")[0];
-      saveLocalDay(user.id,today,next,water);
+      const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
+      if(logDate!==ymdLocal(new Date()))warnNonTodayEditOnce();
+      saveLocalDay(user.id,logDate,next,water);
     }
     if(!user?.token)return;
-    const today=new Date().toISOString().split("T")[0];
+    const logDate=String(selectedDate||ymdLocal(new Date())).slice(0,10);
     const newMeals=next.filter(m=>!prev.find(p=>p.id===m.id));
     const removedMeals=prev.filter(m=>!next.find(n=>n.id===m.id));
 
     for(const rm of removedMeals){
       const payload={id:rm.id};
       if(!netOnline()){enqueueOffline({kind:"meal-delete",payload});continue;}
-      try{await supa.del(user.token,"meals",`id=eq.${encodeURIComponent(rm.id)}&user_id=eq.${user.id}`);}catch(e){enqueueOffline({kind:"meal-delete",payload});}
+      try{await supa.del(user.token,"meals",`id=eq.${encodeURIComponent(rm.id)}&user_id=eq.${user.id}`);}catch(e){logAppError(e,"meal_delete_failed");enqueueOffline({kind:"meal-delete",payload});toast("Network issue — meal delete queued for sync","⚠️");}
     }
 
     const idMap=new Map();
     for(const m of newMeals){
-      const payload={user_id:user.id,name:m.name,calories:m.cal,protein:m.p||0,carbs:m.c||0,fat:m.f||0,emoji:m.e||"🍽️",meal_type:m.m||"Snack",log_date:today};
+      const payload={user_id:user.id,name:m.name,calories:m.cal,protein:m.p||0,carbs:m.c||0,fat:m.f||0,emoji:m.e||"🍽️",meal_type:m.m||"Snack",log_date:logDate};
       if(!netOnline()){enqueueOffline({kind:"meal",payload});continue;}
       try{
         const inserted=await supa.insert(user.token,"meals",payload);
         const row=Array.isArray(inserted)?inserted[0]:null;
         if(row?.id!=null)idMap.set(m.id,row.id);
-      }catch(e){enqueueOffline({kind:"meal",payload});}
+      }catch(e){logAppError(e,"meal_save_failed");enqueueOffline({kind:"meal",payload});toast("Network issue — meal queued for sync","⚠️");}
     }
     if(idMap.size){
       setMeals(cur=>cur.map(it=>idMap.has(it.id)?{...it,id:idMap.get(it.id)}:it));
@@ -3600,10 +4372,56 @@ export default function App(){
       if(user?.token){
         const payload={user_id:user.id,meal_reminders:next.mealReminders,water_reminders:next.waterReminders,health_insights:next.healthInsights,achievement_alerts:next.achievementAlerts,dark_mode:next.darkMode,offline_mode:next.offline,updated_at:new Date().toISOString()};
         if(!netOnline())enqueueOffline({kind:"settings",payload});
-        else supa.upsert(user.token,"settings",payload).catch(()=>enqueueOffline({kind:"settings",payload}));
+        else supa.upsert(user.token,"settings",payload).catch((e)=>{logAppError(e,"settings_save_failed");enqueueOffline({kind:"settings",payload});toast("Network issue — settings queued for sync","⚠️");});
       }
       return next;
     });
+  };
+
+  const parseTimeLabelToMinutes=(label)=>{
+    const txt=String(label||"").trim();
+    const ampm=txt.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])$/);
+    if(ampm){
+      let h=Math.max(0,Math.min(23,+ampm[1]||0));
+      const m=Math.max(0,Math.min(59,+ampm[2]||0));
+      const suffix=ampm[3].toLowerCase();
+      if(suffix==="pm"&&h<12)h+=12;
+      if(suffix==="am"&&h===12)h=0;
+      return h*60+m;
+    }
+    const h24=txt.match(/^(\d{1,2}):(\d{2})$/);
+    if(h24){
+      const h=Math.max(0,Math.min(23,+h24[1]||0));
+      const m=Math.max(0,Math.min(59,+h24[2]||0));
+      return h*60+m;
+    }
+    return null;
+  };
+
+  const isLikelyDuplicateScannerMeal=(candidate)=>{
+    if(!candidate)return false;
+    const candidateName=String(candidate.name||"").trim().toLowerCase();
+    const candidateCal=Math.round(Number(candidate.cal||0));
+    const candidateMealType=String(candidate.m||"").trim().toLowerCase();
+    const now=new Date();
+    const nowMins=now.getHours()*60+now.getMinutes();
+    return meals.some(existing=>{
+      if(String(existing.name||"").trim().toLowerCase()!==candidateName)return false;
+      if(Math.round(Number(existing.cal||0))!==candidateCal)return false;
+      if(candidateMealType&&String(existing.m||"").trim().toLowerCase()!==candidateMealType)return false;
+      const existingMins=parseTimeLabelToMinutes(existing.t);
+      if(existingMins==null)return true;
+      const delta=Math.abs(existingMins-nowMins);
+      return delta<=15;
+    });
+  };
+
+  const onScannerAddMeal=(meal)=>{
+    if(isLikelyDuplicateScannerMeal(meal)){
+      toast("ℹ️ You just logged this meal. Add again if intentional.","❓");
+      return;
+    }
+    setMealsAndSave(p=>[...p,meal]);
   };
 
   useEffect(()=>{
@@ -3625,7 +4443,7 @@ export default function App(){
       saveSession({token:u.token,refresh:u.refresh||s.refresh||"",user_id:u.id});
     }
     toast(`Welcome, ${u.name}! 🎉`,"👋");
-    if(u.token)await loadUserData(u.token,u.id);
+    if(u.token)await loadUserData(u.token,u.id,selectedDate);
     try{
       const firstKey=`nutriscan_first_login_setup_${u.id}`;
       if(!localStorage.getItem(firstKey)){
@@ -3645,6 +4463,7 @@ export default function App(){
     clearSession();
     writeOfflineQueue([]);
     setScreen("landing");setTab("dashboard");setUser(null);
+    setSelectedDate(ymdLocal(new Date()));
     setMeals([]);setWater(0);
     setSettings({mealReminders:true,waterReminders:true,healthInsights:true,achievementAlerts:true,darkMode:false,offline:true});
   };
@@ -3671,11 +4490,11 @@ export default function App(){
         {showNot&&<NotificationsSheet notifications={notifications} onClose={()=>setShowNot(false)} toast={toast} onMarkAllRead={markAllNotifsRead}/>}
         {showAch&&<div className="overlay" onClick={e=>{if(e.target===e.currentTarget)setShowAch(false);}}><div className="sheet"><div className="sheet-handle"/><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}><p style={{fontSize:18,fontWeight:900}}>🏆 Achievements</p><button onClick={()=>setShowAch(false)} className="btn-icon" style={{width:32,height:32,borderRadius:10}}>{Ic.x}</button></div><Achievements user={user} toast={(m,i)=>toast(m,i||"✅")} inline/></div></div>}
         <div style={{height:"100vh",overflowY:"auto",width:"100%"}}>
-          {tab==="dashboard"    && <Dashboard    user={user} setUser={setUser} meals={meals} setMeals={setMealsAndSave} water={water} setWater={setWaterAndSave} toast={(m,i)=>toast(m,i||"✅")} setTab={setTab} showSearch={()=>setShowSrch(true)} openNotifs={openNotifs} hasUnreadNotifs={hasUnreadNotifs} showAwards={()=>setShowAch(true)} playSfx={playAppSfx}/>}
-          {tab==="scanner"      && <Scanner      onAddMeal={m=>setMealsAndSave(p=>[...p,m])} toast={(m,i)=>toast(m,i||"✅")} user={user} online={online} playSfx={playAppSfx}/>}
+          {tab==="dashboard"    && <Dashboard    user={user} setUser={setUser} meals={meals} setMeals={setMealsAndSave} water={water} setWater={setWaterAndSave} toast={(m,i)=>toast(m,i||"✅")} setTab={setTab} showSearch={()=>setShowSrch(true)} openNotifs={openNotifs} hasUnreadNotifs={hasUnreadNotifs} showAwards={()=>setShowAch(true)} playSfx={playAppSfx} selectedDate={selectedDate} onSelectDate={setSelectedDate} isSyncingDate={syncingDate}/>}
+          {tab==="scanner"      && <Scanner      onAddMeal={onScannerAddMeal} toast={(m,i)=>toast(m,i||"✅")} user={user} online={online} playSfx={playAppSfx}/>}
           {tab==="analytics"    && <Analytics    user={user}/>}
           {tab==="ai"           && <AiChat       user={user} meals={meals} toast={(m,i)=>toast(m,i||"✅")} online={online}/>}
-          {tab==="settings"     && <Settings     user={user} setUser={setUser} toast={(m,i)=>toast(m,i||"✅")} onSignOut={signOut} settings={settings} setSetting={setSetting} meals={meals} onDataCleared={()=>{setMeals([]);setWater(0);}} soundFxEnabled={soundFxEnabled} setSoundFxEnabled={setSoundFxEnabled} playSfx={playAppSfx} online={online} aiConfigured={!!OPENROUTER_KEY}/>}
+          {tab==="settings"     && <Settings     user={user} setUser={setUser} toast={(m,i)=>toast(m,i||"✅")} onSignOut={signOut} settings={settings} setSetting={setSetting} meals={meals} onDataCleared={()=>{setMeals([]);setWater(0);if(user?.id){const prefix=`nutriscan_local_${user.id}_`;try{const keys=[];for(let i=0;i<localStorage.length;i++){const key=localStorage.key(i);if(key&&(key.startsWith(prefix)||key.includes(`nutriscan_sport_${user.id}`))){keys.push(key);}}for(const k of keys)localStorage.removeItem(k);}catch(e){}}writeOfflineQueue([]);}} soundFxEnabled={soundFxEnabled} setSoundFxEnabled={setSoundFxEnabled} playSfx={playAppSfx} online={online} aiConfigured={!!OPENROUTER_KEY}/>}
         </div>
         <BottomNav active={tab} setActive={setTab}/>
       </>}

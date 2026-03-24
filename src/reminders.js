@@ -2,10 +2,17 @@ import { Capacitor } from "@capacitor/core";
 import { LocalNotifications } from "@capacitor/local-notifications";
 
 const CHANNEL_ID = "nutriscan-reminders";
-const MEAL_IDS = [1001, 1002, 1003];
-const WATER_IDS = [2100, 2101, 2102, 2103, 2104, 2105, 2106];
-const CONTEXT_IDS = [3101, 3102, 3103, 3201, 3202, 3301, 3401, 3501];
-const ALL_IDS = [...MEAL_IDS, ...WATER_IDS, ...CONTEXT_IDS];
+const SCHEDULE_DAYS_AHEAD = 14;
+const MEAL_BASE_ID = 100000;
+const WATER_BASE_ID = 200000;
+const SLEEP_BASE_ID = 300000;
+const CONTEXT_IDS = [3101, 3102, 3103, 3201, 3202, 3301, 3401, 3501, 3602, 3603, 3604];
+const MEAL_SLOTS = [
+  { key: "breakfast", hour: 8, minute: 0, title: "🌅 Log your breakfast!", body: "Start your day right — log what you ate" },
+  { key: "lunch", hour: 13, minute: 0, title: "☀️ Lunch time!", body: "Don't forget to log your lunch" },
+  { key: "dinner", hour: 19, minute: 30, title: "🌙 Dinner time!", body: "Log your dinner to stay on track" },
+];
+const WATER_SLOTS = [7, 9, 11, 13, 15, 17, 19, 21];
 const IN_TIME_FMT = new Intl.DateTimeFormat("en-IN", {
   hour: "numeric",
   minute: "2-digit",
@@ -24,25 +31,79 @@ const atToday = (hour, minute = 0) => {
   return dt;
 };
 
+const atDay = (dayOffset, hour, minute = 0) => {
+  const dt = new Date();
+  dt.setDate(dt.getDate() + dayOffset);
+  dt.setHours(hour, minute, 0, 0);
+  return dt;
+};
+
 const isFuture = (dateObj) => dateObj.getTime() > Date.now() + 1000;
+
+const soon = (seconds = 2) => new Date(Date.now() + Math.max(1, seconds) * 1000);
 
 const hasMealType = (meals, type) =>
   Array.isArray(meals) && meals.some((m) => String(m?.m || "").toLowerCase() === String(type || "").toLowerCase());
 
+const mealNotificationId = (dayOffset, slotIndex) => MEAL_BASE_ID + (dayOffset * 10) + slotIndex;
+const waterNotificationId = (dayOffset, slotIndex) => WATER_BASE_ID + (dayOffset * 10) + slotIndex;
+const sleepNotificationId = (dayOffset) => SLEEP_BASE_ID + dayOffset;
+
+const buildCancellableIds = () => {
+  const ids = [...CONTEXT_IDS];
+  for (let day = 0; day < SCHEDULE_DAYS_AHEAD; day += 1) {
+    for (let i = 0; i < MEAL_SLOTS.length; i += 1) ids.push(mealNotificationId(day, i));
+    for (let i = 0; i < WATER_SLOTS.length; i += 1) ids.push(waterNotificationId(day, i));
+    ids.push(sleepNotificationId(day));
+  }
+  return ids;
+};
+
+const ensureNotificationAccess = async () => {
+  const current = await LocalNotifications.checkPermissions();
+  if (current.display !== "granted") {
+    const asked = await LocalNotifications.requestPermissions();
+    if (asked.display !== "granted") return false;
+  }
+  if (typeof LocalNotifications.checkExactNotificationSetting === "function") {
+    const exact = await LocalNotifications.checkExactNotificationSetting().catch(() => null);
+    if (exact?.value === "disabled" && typeof LocalNotifications.changeExactNotificationSetting === "function") {
+      await LocalNotifications.changeExactNotificationSetting().catch(() => null);
+    }
+  }
+  return true;
+};
+
+const baseSchedule = (at) => ({ at, allowWhileIdle: true });
+
 /**
  * Syncs daily meal + water local notifications from Settings toggles.
+ * Includes conditional notifications for meal logging, calorie goals, and streaks.
  * No-op on web / non-native builds.
  */
-export async function syncMealWaterReminders({ mealReminders, waterReminders, meals = [], water = 0 }) {
+export async function syncMealWaterReminders({ 
+  mealReminders, 
+  waterReminders, 
+  sleepReminderEnabled = false,
+  sleepReminderHour = 22,
+  sleepReminderMinute = 30,
+  meals = [], 
+  water = 0,
+  caloriesEaten = 0,
+  calorieTarget = 2000,
+  currentStreak = 0,
+  streakJustHit7 = false
+}) {
   if (!Capacitor.isNativePlatform()) return;
   try {
+    const cancellableIds = buildCancellableIds();
     await LocalNotifications.cancel({
-      notifications: ALL_IDS.map((id) => ({ id })),
+      notifications: cancellableIds.map((id) => ({ id })),
     });
-    if (!mealReminders && !waterReminders) return;
+    if (!mealReminders && !waterReminders && !sleepReminderEnabled) return;
 
-    const perm = await LocalNotifications.requestPermissions();
-    if (perm.display !== "granted") return;
+    const hasAccess = await ensureNotificationAccess();
+    if (!hasAccess) return;
 
     await LocalNotifications.createChannel({
       id: CHANNEL_ID,
@@ -55,41 +116,51 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
     const notifications = [];
 
     if (mealReminders) {
-      notifications.push(
-        {
-          id: 1001,
-          title: `🌅 Breakfast • ${formatTime12(9, 0)}`,
-          body: "Start your day strong — log breakfast in NutriScan.",
-          channelId: CHANNEL_ID,
-          schedule: { every: "day", on: { hour: 9, minute: 0 } },
-        },
-        {
-          id: 1002,
-          title: `☀️ Lunch • ${formatTime12(13, 0)}`,
-          body: "Midday check-in — log lunch and stay on track.",
-          channelId: CHANNEL_ID,
-          schedule: { every: "day", on: { hour: 13, minute: 0 } },
-        },
-        {
-          id: 1003,
-          title: `🌙 Dinner • ${formatTime12(20, 0)}`,
-          body: "Wrap up your day by logging dinner.",
-          channelId: CHANNEL_ID,
-          schedule: { every: "day", on: { hour: 20, minute: 0 } },
-        }
-      );
+      for (let day = 0; day < SCHEDULE_DAYS_AHEAD; day += 1) {
+        MEAL_SLOTS.forEach((slot, slotIndex) => {
+          const at = atDay(day, slot.hour, slot.minute);
+          if (!isFuture(at)) return;
+          notifications.push({
+            id: mealNotificationId(day, slotIndex),
+            title: slot.title,
+            body: slot.body,
+            channelId: CHANNEL_ID,
+            schedule: baseSchedule(at),
+          });
+        });
+      }
     }
 
     if (waterReminders) {
-      [9, 11, 13, 15, 17, 19, 21].forEach((hour, i) => {
-        notifications.push({
-          id: WATER_IDS[i],
-          title: `💧 Hydration • ${formatTime12(hour, 0)}`,
-          body: "Quick water break — tap NutriScan to log a glass.",
-          channelId: CHANNEL_ID,
-          schedule: { every: "day", on: { hour, minute: 0 } },
+      for (let day = 0; day < SCHEDULE_DAYS_AHEAD; day += 1) {
+        WATER_SLOTS.forEach((hour, slotIndex) => {
+          const at = atDay(day, hour, 0);
+          if (!isFuture(at)) return;
+          notifications.push({
+            id: waterNotificationId(day, slotIndex),
+            title: `💧 Water reminder`,
+            body: "Time to hydrate — tap NutriScan to log a glass of water",
+            channelId: CHANNEL_ID,
+            schedule: baseSchedule(at),
+          });
         });
-      });
+      }
+    }
+
+    if (sleepReminderEnabled) {
+      const sleepHour = Number.isFinite(+sleepReminderHour) ? Math.min(23, Math.max(0, +sleepReminderHour)) : 22;
+      const sleepMinute = Number.isFinite(+sleepReminderMinute) ? Math.min(59, Math.max(0, +sleepReminderMinute)) : 30;
+      for (let day = 0; day < SCHEDULE_DAYS_AHEAD; day += 1) {
+        const at = atDay(day, sleepHour, sleepMinute);
+        if (!isFuture(at)) continue;
+        notifications.push({
+          id: sleepNotificationId(day),
+          title: `😴 Sleep reminder`,
+          body: `Wind down and sleep on time (${formatTime12(sleepHour, sleepMinute)}).`,
+          channelId: CHANNEL_ID,
+          schedule: baseSchedule(at),
+        });
+      }
     }
 
     const hasBreakfast = hasMealType(meals, "Breakfast");
@@ -98,41 +169,41 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
     const hasAnyMeal = Array.isArray(meals) && meals.length > 0;
 
     if (mealReminders) {
-      const preBreakfastAt = atToday(8, 45);
-      const preLunchAt = atToday(12, 45);
-      const preDinnerAt = atToday(19, 45);
+      const breakfastMissAt = atToday(9, 30);
+      const lunchMissAt = atToday(14, 30);
+      const dinnerMissAt = atToday(20, 30);
       const noLogAfternoonAt = atToday(14, 0);
       const noLogNightAt = atToday(21, 0);
       const closeoutAt = atToday(21, 20);
       const prepAt = atToday(21, 30);
 
-      if (!hasBreakfast && isFuture(preBreakfastAt)) {
+      if (!hasBreakfast && isFuture(breakfastMissAt)) {
         notifications.push({
           id: 3101,
-          title: `🍽️ Pre-meal • ${formatTime12(8, 45)}`,
-          body: "Breakfast time is near — get ready to log your meal.",
+          title: `🌅 Time to log breakfast!`,
+          body: "It's morning and no breakfast logged yet",
           channelId: CHANNEL_ID,
-          schedule: { at: preBreakfastAt },
+          schedule: baseSchedule(breakfastMissAt),
         });
       }
 
-      if (!hasLunch && isFuture(preLunchAt)) {
+      if (!hasLunch && isFuture(lunchMissAt)) {
         notifications.push({
           id: 3102,
-          title: `🍽️ Pre-meal • ${formatTime12(12, 45)}`,
-          body: "Lunch is coming up — log it in NutriScan after eating.",
+          title: `☀️ Log your lunch!`,
+          body: "Don't forget to track your midday meal",
           channelId: CHANNEL_ID,
-          schedule: { at: preLunchAt },
+          schedule: baseSchedule(lunchMissAt),
         });
       }
 
-      if (!hasDinner && isFuture(preDinnerAt)) {
+      if (!hasDinner && isFuture(dinnerMissAt)) {
         notifications.push({
           id: 3103,
-          title: `🍽️ Pre-meal • ${formatTime12(19, 45)}`,
-          body: "Dinner window is near — remember to log your last meal.",
+          title: `🌙 Log your dinner!`,
+          body: "Almost end of day — track your last meal",
           channelId: CHANNEL_ID,
-          schedule: { at: preDinnerAt },
+          schedule: baseSchedule(dinnerMissAt),
         });
       }
 
@@ -142,7 +213,7 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
           title: `📝 No log yet • ${formatTime12(14, 0)}`,
           body: "You haven't logged any meal yet today.",
           channelId: CHANNEL_ID,
-          schedule: { at: noLogAfternoonAt },
+          schedule: baseSchedule(noLogAfternoonAt),
         });
       }
 
@@ -152,7 +223,7 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
           title: `📝 Gentle nudge • ${formatTime12(21, 0)}`,
           body: "No dinner log yet — add your meal to complete today.",
           channelId: CHANNEL_ID,
-          schedule: { at: noLogNightAt },
+          schedule: baseSchedule(noLogNightAt),
         });
       }
 
@@ -162,7 +233,7 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
           title: `🌙 Day closeout • ${formatTime12(21, 20)}`,
           body: "Log your dinner/last meal before day ends.",
           channelId: CHANNEL_ID,
-          schedule: { at: closeoutAt },
+          schedule: baseSchedule(closeoutAt),
         });
       }
 
@@ -172,7 +243,7 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
           title: `🗓️ Next-day prep • ${formatTime12(21, 30)}`,
           body: "Set a quick plan for tomorrow's meals.",
           channelId: CHANNEL_ID,
-          schedule: { at: prepAt },
+          schedule: baseSchedule(prepAt),
         });
       }
     }
@@ -185,13 +256,87 @@ export async function syncMealWaterReminders({ mealReminders, waterReminders, me
           title: `💧 Catch-up • ${formatTime12(18, 30)}`,
           body: `Water is low (${water} glasses). Let's catch up this evening.`,
           channelId: CHANNEL_ID,
-          schedule: { at: hydrationCatchUpAt },
+          schedule: baseSchedule(hydrationCatchUpAt),
         });
       }
+    }
+
+    if (caloriesEaten > 0 && calorieTarget > 0) {
+      if (caloriesEaten > calorieTarget) {
+        const overAmount = caloriesEaten - calorieTarget;
+        notifications.push({
+          id: 3602,
+          title: `⚠️ Over your goal!`,
+          body: `You're ${Math.round(overAmount)} kcal over today's target`,
+          channelId: CHANNEL_ID,
+          schedule: baseSchedule(soon(2)),
+        });
+      }
+      else if (caloriesEaten >= calorieTarget * 0.95) {
+        const remainingAmount = calorieTarget - caloriesEaten;
+        notifications.push({
+          id: 3603,
+          title: `🎯 Almost at your goal!`,
+          body: `Just ${Math.round(remainingAmount)} kcal away from your target`,
+          channelId: CHANNEL_ID,
+          schedule: baseSchedule(soon(2)),
+        });
+      }
+    }
+
+    if (streakJustHit7) {
+      notifications.push({
+        id: 3604,
+        title: `🔥 7-day streak!`,
+        body: `Amazing consistency — keep it up!`,
+        channelId: CHANNEL_ID,
+        schedule: baseSchedule(soon(2)),
+      });
     }
 
     if (notifications.length) await LocalNotifications.schedule({ notifications });
   } catch (e) {
     /* fail silently */
+  }
+}
+
+export async function scheduleDailyReminderExample({
+  id = 3901,
+  title = "⏰ Daily reminder",
+  body = "It's 2:00 PM — time for your NutriScan reminder.",
+  hour = 14,
+  minute = 0,
+} = {}) {
+  if (!Capacitor.isNativePlatform()) return false;
+  try {
+    const hasAccess = await ensureNotificationAccess();
+    if (!hasAccess) return false;
+
+    await LocalNotifications.createChannel({
+      id: CHANNEL_ID,
+      name: "Meal & water reminders",
+      description: "Gentle nudges to log meals and water in NutriScan",
+      importance: 4,
+      visibility: 1,
+    });
+
+    await LocalNotifications.cancel({ notifications: [{ id }] }).catch(() => null);
+
+    const todayAt = atToday(hour, minute);
+    const fireAt = isFuture(todayAt) ? todayAt : atDay(1, hour, minute);
+
+    await LocalNotifications.schedule({
+      notifications: [{
+        id,
+        title,
+        body,
+        channelId: CHANNEL_ID,
+        schedule: baseSchedule(fireAt),
+      }],
+    });
+
+    return true;
+  } catch {
+    return false;
   }
 }

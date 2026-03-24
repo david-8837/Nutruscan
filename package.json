@@ -13,6 +13,7 @@
     "supabase:verify": "npx supabase functions list --project-ref piolbedugsubngftsrkm && npx supabase secrets list --project-ref piolbedugsubngftsrkm"
   },
   "dependencies": {
+    "@capacitor-community/camera-preview": "^6.0.1",
     "@capacitor/android": "^6.2.0",
     "@capacitor/app": "^6.0.2",
     "@capacitor/browser": "^6.0.2",
